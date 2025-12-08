@@ -83,7 +83,8 @@ physrisk = [
     "data/static/*.json",
     "data/static/example_portfolios/*.json",
     "data/static/hazard/*.json",
-    "data/static/vulnerability/*.json"
+    "data/static/vulnerability/*.json",
+    "data/static/vulnerability/oed_hazus/*.csv"
 ]
 
 [dependency-groups]
@@ -126,7 +127,12 @@ dev = [
     "mypy",
     "pre-commit",
     "ruff",
-    "tox"
+    "tox",
+]
+
+[project.optional-dependencies]
+test = [
+    "openpyxl>=3.1.5",
 ]
 
 [tool.pytest.ini_options]
