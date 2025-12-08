@@ -1,5 +1,5 @@
 from enum import Enum
-from typing import Annotated, Dict, List, Optional, Sequence, Union
+from typing import Annotated, Dict, List, Optional, Protocol, Sequence, Union
 
 import numpy as np
 import numpy.typing as npt

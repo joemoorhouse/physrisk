@@ -1,7 +1,8 @@
-from typing import Dict, MutableMapping, Optional, Set, Type
+from typing import Dict, MutableMapping, Optional, Protocol, Sequence, Set, Type
 
 from dependency_injector import containers, providers
 
+from physrisk.api.v1.common import Asset as APIAsset
 from physrisk.data.hazard_data_provider import SourcePaths
 from physrisk.data.image_creator import ImageCreator
 from physrisk.data.inventory import EmbeddedInventory, Inventory
@@ -9,6 +10,7 @@ from physrisk.data.inventory_reader import InventoryReader
 from physrisk.data.pregenerated_hazard_model import ZarrHazardModel
 from physrisk.data.zarr_reader import ZarrReader
 from physrisk.kernel import calculation as calc
+from physrisk.kernel.assets import Asset
 from physrisk.kernel.hazard_model import HazardModelFactory
 from physrisk.kernel.hazards import Hazard
 from physrisk.kernel.vulnerability_model import (
@@ -21,8 +23,8 @@ from physrisk.requests import (
     Requester,
     _create_inventory,
     create_source_paths,
+    create_assets
 )
-
 
 class ZarrHazardModelFactory(HazardModelFactory):
     def __init__(
@@ -69,6 +71,8 @@ class DictBasedVulnerabilityModelsFactory(VulnerabilityModelsFactory):
 
 
 class Container(containers.DeclarativeContainer):
+    asset_factory = providers.Factory()
+    
     config = providers.Configuration(default={"zarr_sources": ["embedded", "hazard"]})
 
     colormaps = providers.Singleton(lambda: EmbeddedInventory().colormaps())

@@ -1,13 +1,13 @@
 import importlib
 import json
 from importlib import import_module
-from typing import Any, Callable, Dict, List, Optional, Sequence, Type, Union, cast
+from typing import Any, Callable, Dict, List, Optional, Protocol, Sequence, Type, Union, cast
 
 import numpy as np
 
 import physrisk.data.static.example_portfolios
 import physrisk.kernel.hazard_model
-from physrisk.api.v1.common import Distribution, ExceedanceCurve, VulnerabilityDistrib
+from physrisk.api.v1.common import Asset as APIAsset, Distribution, ExceedanceCurve, VulnerabilityDistrib
 from physrisk.api.v1.exposure_req_resp import (
     AssetExposure,
     AssetExposureRequest,
@@ -410,6 +410,36 @@ def _get_hazard_data(
     return response
 
 
+class AssetFactory(Protocol):
+    def create_assets(self, api_assets: Sequence[APIAsset]) -> Sequence[Asset]:
+        ...
+
+
+class DefaultAssetFactory(AssetFactory):    
+    def __init__(self):
+        pass
+    
+    def create_assets(self, api_assets: Sequence[APIAsset]):
+        module = import_module("physrisk.kernel.assets")
+        asset_objs = []
+        for item in api_assets:
+            if hasattr(module, item.asset_class):
+                init = getattr(module, item.asset_class)
+                kwargs = {}
+                kwargs.update(item.__dict__)
+                if item.model_extra is not None:
+                    kwargs.update(item.model_extra)
+                del kwargs["asset_class"]
+                asset_obj = cast(
+                    Asset,
+                    init(**kwargs),
+                )
+                asset_objs.append(asset_obj)
+            else:
+                raise ValueError(f"asset type '{item.asset_class}' not found")
+        return asset_objs
+
+
 def create_assets(api_assets: Assets, assets: Optional[List[Asset]] = None):
     """Create list of Asset objects from the Assets API object:"""
     if assets is not None:
@@ -419,24 +449,7 @@ def create_assets(api_assets: Assets, assets: Optional[List[Asset]] = None):
             )
         return assets
     else:
-        module = import_module("physrisk.kernel.assets")
-        asset_objs = []
-        for item in api_assets.items:
-            if hasattr(module, item.asset_class):
-                init = getattr(module, item.asset_class)
-                kwargs = {}
-                kwargs.update(item.__dict__)
-                if item.model_extra is not None:
-                    kwargs.update(item.model_extra)
-                del kwargs["asset_class"], kwargs["latitude"], kwargs["longitude"]
-                asset_obj = cast(
-                    Asset,
-                    init(item.latitude, item.longitude, **kwargs),
-                )
-                asset_objs.append(asset_obj)
-            else:
-                raise ValueError(f"asset type '{item.asset_class}' not found")
-        return asset_objs
+        return DefaultAssetFactory().create_assets(api_assets.items)
 
 
 def _get_asset_exposures(

@@ -135,8 +135,8 @@ class TestRiskModels(TestWithCredentials):
     def _create_assets(self):
         assets = [
             RealEstateAsset(
-                TestData.latitudes[0],
-                TestData.longitudes[0],
+                latitude=TestData.latitudes[0],
+                longitude=TestData.longitudes[0],
                 location="Asia",
                 type="Buildings/Industrial",
                 id=f"unique_asset_{i}",
