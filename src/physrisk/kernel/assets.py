@@ -142,7 +142,7 @@ class OEDAsset(Asset):
         number_of_storeys: int = 0, # -1 = unknown No. storeys - low rise, -2 = unknown No. storeys - mid rise, -3 = Unknown no. storeys = high rise).
         basement: int = 0, # 0 = unknown / default, 1 = unfinished, 2 = 100% finished
         construction_code: int = 5000,
-        first_floor_height: float = -1.0,
+        first_floor_height: float = 0.3,
         **kwargs,
     ):
         super().__init__(latitude=latitude, longitude=longitude, wkt=wkt, **kwargs)
