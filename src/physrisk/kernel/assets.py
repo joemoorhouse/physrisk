@@ -10,16 +10,17 @@ oed_occ_codes_to_asset_types = {
     1000: "Asset",
     (1050, 1099): ("RealEstateAsset", "Buildings/Residential"),
     (1100, 1125): ("RealEstateAsset", "Buildings/Commercial"),
-    (1150, 1159): ("ManufacturingAsset", None), # Industrial
+    (1150, 1159): ("ManufacturingAsset", None),  # Industrial
     (1200, 1231): ("RealEstateAsset", "Buildings/Commercial"),
     (1250, 1256): ("TransportationAsset", None),
     (1260, 1260): ("ManufacturingAsset", None),
     (1300, 1350): ("UtilitiesAsset", None),
     (1300, 1350): ("UtilitiesAsset", None),
     (1300, 1412): ("TransportationAsset", None),  # Marine cargo
-    (2000, 2780): ("ManufacturingAsset", None), # Industrial Facility Models
-    (2000, 2780): ("ManufacturingAsset", None), # Industrial Facility Models
-}    
+    (2000, 2780): ("ManufacturingAsset", None),  # Industrial Facility Models
+    (2000, 2780): ("ManufacturingAsset", None),  # Industrial Facility Models
+}
+
 
 # 'primary_fuel' entries in Global Power Plant Database v1.3.0 (World Resources Institute)
 # https://wri-dataportal-prod.s3.amazonaws.com/manual/global_power_plant_database_v_1_3
@@ -105,12 +106,12 @@ class Asset:
     """
 
     def __init__(
-        self, 
+        self,
         latitude: Optional[float] = None,
         longitude: Optional[float] = None,
         wkt: Optional[str] = None,
-        id: Optional[str] = None, 
-        **kwargs
+        id: Optional[str] = None,
+        **kwargs,
     ):
         self.id = id
         if latitude is None or longitude is None:
@@ -127,8 +128,10 @@ class Asset:
             # create a hash of the wkt, using SHA256 but truncating to 20 characters for brevity
             # collision probability still extremely low
             digest = hashlib.sha256(self.geom.wkb).digest()
-            self.wkt_hash = base64.urlsafe_b64encode(digest).rstrip(b'=').decode('ascii')[0:20]
-        
+            self.wkt_hash = (
+                base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")[0:20]
+            )
+
         self.__dict__.update(kwargs)
 
 
@@ -139,8 +142,8 @@ class OEDAsset(Asset):
         longitude: Optional[float] = None,
         oed_occupancy_code: int = 1,
         wkt: Optional[str] = None,
-        number_of_storeys: int = 0, # -1 = unknown No. storeys - low rise, -2 = unknown No. storeys - mid rise, -3 = Unknown no. storeys = high rise).
-        basement: int = 0, # 0 = unknown / default, 1 = unfinished, 2 = 100% finished
+        number_of_storeys: int = 0,  # -1 = unknown No. storeys - low rise, -2 = unknown No. storeys - mid rise, -3 = Unknown no. storeys = high rise).
+        basement: int = 0,  # 0 = unknown / default, 1 = unfinished, 2 = 100% finished
         construction_code: int = 5000,
         first_floor_height: float = 0.3,
         **kwargs,
@@ -163,16 +166,12 @@ class SimpleTypeLocationAsset(Asset):
 
 
 class AgricultureAsset(OEDAsset, SimpleTypeLocationAsset):
-    def __init__(
-        self, **kwargs
-    ):
+    def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
 
 class ConstructionAsset(OEDAsset, SimpleTypeLocationAsset):
-    def __init__(
-        self, **kwargs
-    ):
+    def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
 
@@ -183,21 +182,24 @@ class IndustrialActivity(OEDAsset, SimpleTypeLocationAsset):
     """
 
     def __init__(
-        self, **kwargs,
+        self,
+        **kwargs,
     ):
         super().__init__(**kwargs)
 
 
 class ManufacturingAsset(OEDAsset, SimpleTypeLocationAsset):
     def __init__(
-        self, **kwargs,
+        self,
+        **kwargs,
     ):
         super().__init__(**kwargs)
 
 
 class OilGasAsset(OEDAsset, SimpleTypeLocationAsset):
     def __init__(
-        self, **kwargs,
+        self,
+        **kwargs,
     ):
         super().__init__(**kwargs)
 
@@ -219,9 +221,7 @@ class PowerGeneratingAsset(OEDAsset, SimpleTypeLocationAsset):
 
 
 class RealEstateAsset(OEDAsset, SimpleTypeLocationAsset):
-    def __init__(
-        self, **kwargs
-    ):
+    def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
 
@@ -267,16 +267,12 @@ class TestAsset(Asset):
 
 
 class TransportationAsset(OEDAsset, SimpleTypeLocationAsset):
-    def __init__(
-        self, **kwargs
-    ):
+    def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
 
 class UtilityAsset(OEDAsset, SimpleTypeLocationAsset):
-    def __init__(
-        self, **kwargs
-    ):
+    def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
 

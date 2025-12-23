@@ -1,13 +1,29 @@
 import importlib
 import json
 from importlib import import_module
-from typing import Any, Callable, Dict, List, Optional, Protocol, Sequence, Type, Union, cast
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Protocol,
+    Sequence,
+    Type,
+    Union,
+    cast,
+)
 
 import numpy as np
 
 import physrisk.data.static.example_portfolios
 import physrisk.kernel.hazard_model
-from physrisk.api.v1.common import Asset as APIAsset, Distribution, ExceedanceCurve, VulnerabilityDistrib
+from physrisk.api.v1.common import (
+    Asset as APIAsset,
+    Distribution,
+    ExceedanceCurve,
+    VulnerabilityDistrib,
+)
 from physrisk.api.v1.exposure_req_resp import (
     AssetExposure,
     AssetExposureRequest,
@@ -411,14 +427,13 @@ def _get_hazard_data(
 
 
 class AssetFactory(Protocol):
-    def create_assets(self, api_assets: Sequence[APIAsset]) -> Sequence[Asset]:
-        ...
+    def create_assets(self, api_assets: Sequence[APIAsset]) -> Sequence[Asset]: ...
 
 
-class DefaultAssetFactory(AssetFactory):    
+class DefaultAssetFactory(AssetFactory):
     def __init__(self):
         pass
-    
+
     def create_assets(self, api_assets: Sequence[APIAsset]):
         module = import_module("physrisk.kernel.assets")
         asset_objs = []
