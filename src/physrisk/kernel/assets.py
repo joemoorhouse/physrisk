@@ -15,9 +15,7 @@ oed_occ_codes_to_asset_types = {
     (1250, 1256): ("TransportationAsset", None),
     (1260, 1260): ("ManufacturingAsset", None),
     (1300, 1350): ("UtilitiesAsset", None),
-    (1300, 1350): ("UtilitiesAsset", None),
     (1300, 1412): ("TransportationAsset", None),  # Marine cargo
-    (2000, 2780): ("ManufacturingAsset", None),  # Industrial Facility Models
     (2000, 2780): ("ManufacturingAsset", None),  # Industrial Facility Models
 }
 
