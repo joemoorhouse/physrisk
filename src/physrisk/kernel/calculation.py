@@ -90,6 +90,23 @@ def get_default_vulnerability_models() -> Dict[type, Sequence[VulnerabilityModel
     }
 
 
+def get_non_config_based_vulnerability_models() -> Dict[
+    type, Sequence[VulnerabilityModelBase]
+]:
+    """Get vulnerability models which cannot currently be represented as config."""
+    return {
+        PowerGeneratingAsset: [pgam.InundationModel()],
+        ThermalPowerGeneratingAsset: [
+            ThermalPowerGenerationAirTemperatureModel(),
+            ThermalPowerGenerationCoastalInundationModel(),
+            ThermalPowerGenerationDroughtModel(),
+            ThermalPowerGenerationRiverineInundationModel(),
+            ThermalPowerGenerationWaterStressModel(),
+            ThermalPowerGenerationWaterTemperatureModel(),
+        ],
+    }
+
+
 def get_default_risk_measure_calculators() -> Dict[Type[Asset], RiskMeasureCalculator]:
     """For asset-level risk measure, define the measure calculators to use."""
     return {RealEstateAsset: RealEstateToyRiskMeasures()}

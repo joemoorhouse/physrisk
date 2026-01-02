@@ -13,8 +13,8 @@ from physrisk.kernel.hazard_model import HazardModelFactory
 from physrisk.kernel.hazards import Hazard
 from physrisk.kernel.vulnerability_model import (
     DictBasedVulnerabilityModels,
-    VulnerabilityModels,
-    VulnerabilityModelsFactory,
+    VulnerabilityModels as PVulnerabilityModels,
+    VulnerabilityModelsFactory as PVulnerabilityModelsFactory,
 )
 from physrisk.requests import (
     PhysriskDefaultEncoder,
@@ -22,6 +22,10 @@ from physrisk.requests import (
     _create_inventory,
     create_source_paths,
 )
+from physrisk.vulnerability_models.configuration.asset_factory import (
+    DefaultAssetFactory,
+)
+from physrisk.vulnerability_models.vulnerability import VulnerabilityModels
 
 
 class ZarrHazardModelFactory(HazardModelFactory):
@@ -61,15 +65,15 @@ class ZarrHazardModelFactory(HazardModelFactory):
         return ImageCreator(self.inventory, self.source_paths, self.reader)
 
 
-class DictBasedVulnerabilityModelsFactory(VulnerabilityModelsFactory):
+class DictBasedVulnerabilityModelsFactory(PVulnerabilityModelsFactory):
     def vulnerability_models(
         self, hazard_scope: Optional[Set[Type[Hazard]]] = None
-    ) -> VulnerabilityModels:
+    ) -> PVulnerabilityModels:
         return DictBasedVulnerabilityModels(calc.get_default_vulnerability_models())
 
 
 class Container(containers.DeclarativeContainer):
-    asset_factory = providers.Factory()
+    asset_factory = providers.Factory(DefaultAssetFactory)
 
     config = providers.Configuration(default={"zarr_sources": ["embedded", "hazard"]})
 
@@ -91,6 +95,9 @@ class Container(containers.DeclarativeContainer):
 
     zarr_reader = providers.Singleton(ZarrReader, store=zarr_store)
 
+    # why do we have factories for hazard models, vulnerability models and measures?
+    # this is because the models may need to be created with different parameters for different requests
+
     hazard_model_factory = providers.Factory(
         ZarrHazardModelFactory,
         inventory=inventory,
@@ -106,6 +113,7 @@ class Container(containers.DeclarativeContainer):
 
     requester = providers.Singleton(
         Requester,
+        asset_factory=asset_factory,
         hazard_model_factory=hazard_model_factory,
         vulnerability_models_factory=vulnerability_models_factory,
         inventory=inventory,

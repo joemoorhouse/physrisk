@@ -6,19 +6,6 @@ from typing import Optional
 
 import shapely.wkt
 
-oed_occ_codes_to_asset_types = {
-    1000: "Asset",
-    (1050, 1099): ("RealEstateAsset", "Buildings/Residential"),
-    (1100, 1125): ("RealEstateAsset", "Buildings/Commercial"),
-    (1150, 1159): ("ManufacturingAsset", None),  # Industrial
-    (1200, 1231): ("RealEstateAsset", "Buildings/Commercial"),
-    (1250, 1256): ("TransportationAsset", None),
-    (1260, 1260): ("ManufacturingAsset", None),
-    (1300, 1350): ("UtilitiesAsset", None),
-    (1300, 1412): ("TransportationAsset", None),  # Marine cargo
-    (2000, 2780): ("ManufacturingAsset", None),  # Industrial Facility Models
-}
-
 
 # 'primary_fuel' entries in Global Power Plant Database v1.3.0 (World Resources Institute)
 # https://wri-dataportal-prod.s3.amazonaws.com/manual/global_power_plant_database_v_1_3
@@ -138,12 +125,12 @@ class OEDAsset(Asset):
         self,
         latitude: Optional[float] = None,
         longitude: Optional[float] = None,
-        oed_occupancy_code: int = 1,
+        oed_occupancy_code: int = 1000,
         wkt: Optional[str] = None,
         number_of_storeys: int = 0,  # -1 = unknown No. storeys - low rise, -2 = unknown No. storeys - mid rise, -3 = Unknown no. storeys = high rise).
         basement: int = 0,  # 0 = unknown / default, 1 = unfinished, 2 = 100% finished
         construction_code: int = 5000,
-        first_floor_height: float = 0.3,
+        first_floor_height: float = 0.305,
         **kwargs,
     ):
         super().__init__(latitude=latitude, longitude=longitude, wkt=wkt, **kwargs)
