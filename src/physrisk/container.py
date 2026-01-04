@@ -25,7 +25,6 @@ from physrisk.requests import (
 from physrisk.vulnerability_models.configuration.asset_factory import (
     DefaultAssetFactory,
 )
-from physrisk.vulnerability_models.vulnerability import VulnerabilityModels
 
 
 class ZarrHazardModelFactory(HazardModelFactory):
