@@ -49,8 +49,25 @@ def get_default_hazard_model() -> HazardModel:
     return ZarrHazardModel(source_paths=get_default_source_paths())
 
 
-def get_default_vulnerability_models() -> Dict[type, Sequence[VulnerabilityModelBase]]:
-    """Get default exposure/vulnerability models for different asset types."""
+def default_vulnerability_models() -> Dict[type, Sequence[VulnerabilityModelBase]]:
+    """Base set of programmatic models for combination with config-based models."""
+    return {
+        PowerGeneratingAsset: [pgam.InundationModel()],
+        ThermalPowerGeneratingAsset: [
+            ThermalPowerGenerationAirTemperatureModel(),
+            ThermalPowerGenerationCoastalInundationModel(),
+            ThermalPowerGenerationDroughtModel(),
+            ThermalPowerGenerationRiverineInundationModel(),
+            ThermalPowerGenerationWaterStressModel(),
+            ThermalPowerGenerationWaterTemperatureModel(),
+        ],
+    }
+
+
+def default_vulnerability_models_scores() -> Dict[
+    type, Sequence[VulnerabilityModelBase]
+]:
+    """A vulnerability models set that combines loss-based and exposure-based scores."""
     return {
         Asset: [
             # This is for a generic 'unknown' asset. To be replaced by a config-based model (when complete)
@@ -87,23 +104,6 @@ def get_default_vulnerability_models() -> Dict[type, Sequence[VulnerabilityModel
             ThermalPowerGenerationWaterTemperatureModel(),
         ],
         TestAsset: [pgam.TemperatureModel()],
-    }
-
-
-def get_non_config_based_vulnerability_models() -> Dict[
-    type, Sequence[VulnerabilityModelBase]
-]:
-    """Get vulnerability models which cannot currently be represented as config."""
-    return {
-        PowerGeneratingAsset: [pgam.InundationModel()],
-        ThermalPowerGeneratingAsset: [
-            ThermalPowerGenerationAirTemperatureModel(),
-            ThermalPowerGenerationCoastalInundationModel(),
-            ThermalPowerGenerationDroughtModel(),
-            ThermalPowerGenerationRiverineInundationModel(),
-            ThermalPowerGenerationWaterStressModel(),
-            ThermalPowerGenerationWaterTemperatureModel(),
-        ],
     }
 
 

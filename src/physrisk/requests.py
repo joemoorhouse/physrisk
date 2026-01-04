@@ -486,7 +486,7 @@ def _get_asset_impacts(
     ] = lambda x: x,
 ):
     vulnerability_models = (
-        DictBasedVulnerabilityModels(calc.get_default_vulnerability_models())
+        DictBasedVulnerabilityModels(calc.default_vulnerability_models_scores())
         if vulnerability_models is None
         else vulnerability_models
     )

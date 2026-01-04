@@ -68,7 +68,7 @@ class DictBasedVulnerabilityModelsFactory(PVulnerabilityModelsFactory):
     def vulnerability_models(
         self, hazard_scope: Optional[Set[Type[Hazard]]] = None
     ) -> PVulnerabilityModels:
-        return DictBasedVulnerabilityModels(calc.get_default_vulnerability_models())
+        return DictBasedVulnerabilityModels(calc.default_vulnerability_models_scores())
 
 
 class Container(containers.DeclarativeContainer):
