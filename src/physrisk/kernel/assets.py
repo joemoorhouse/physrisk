@@ -125,7 +125,7 @@ class OEDAsset(Asset):
         self,
         latitude: Optional[float] = None,
         longitude: Optional[float] = None,
-        oed_occupancy_code: int = 1000,
+        occupancy_code: int = 1000,
         wkt: Optional[str] = None,
         number_of_storeys: int = 0,  # -1 = unknown No. storeys - low rise, -2 = unknown No. storeys - mid rise, -3 = Unknown no. storeys = high rise).
         basement: int = 0,  # 0 = unknown / default, 1 = unfinished, 2 = 100% finished
@@ -134,7 +134,7 @@ class OEDAsset(Asset):
         **kwargs,
     ):
         super().__init__(latitude=latitude, longitude=longitude, wkt=wkt, **kwargs)
-        self.oed_occupancy_code = oed_occupancy_code
+        self.occupancy_code = occupancy_code
         self.number_of_storeys = number_of_storeys
         self.basement = basement
         self.construction_code = construction_code

@@ -154,10 +154,7 @@ class TestRiskModels(TestWithCredentials):
                     "location": asset.location,
                     "longitude": asset.longitude,
                     "latitude": asset.latitude,
-                    "attributes": {
-                        "number_of_storeys": "2",
-                        "structure_type": "concrete",
-                    },
+                    "number_of_storeys": 2,
                 }
                 for asset in assets
             ],

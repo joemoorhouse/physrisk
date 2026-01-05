@@ -73,13 +73,13 @@ class Asset(BaseModel):
         description="Location (e.g. Africa, Asia, Europe, North America, Oceania, South America); this is used to select location-specific"
         "vulnerability functions where available.",
     )
-    occupancy_code: Optional[int] = Field(
-        default=None,
+    occupancy_code: int = Field(
+        default=1000,
         description="Occupancy code. This is Open Exposure Data occupancy code, unless otherwise specified. Defaults"
         "to None, rather than 1000 (unknown) to indicate that asset_class field is to be used.",
     )
     number_of_storeys: Optional[int] = Field(
-        default=None,
+        default=-1,
         description="Number of storeys. Can also take special values: "
         "-1 = unknown number of storeys - low rise, -2 = unknown number of storeys - mid rise, -3 = Unknown number of storeys = high rise)",
     )
@@ -101,6 +101,7 @@ class Asset(BaseModel):
     capacity: Optional[float] = Field(
         default=None,
         description="Power generation capacity in MW for power generating assets.",
+        kw_only=True,
     )
 
     model_config = {
