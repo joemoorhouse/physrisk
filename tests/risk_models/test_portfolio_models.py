@@ -1,5 +1,5 @@
 import logging
-from typing import Dict, Optional
+from typing import Dict, Optional, cast
 
 from dependency_injector import providers
 import numpy as np
@@ -15,7 +15,7 @@ from physrisk.api.v1.impact_req_resp import (
 from physrisk.container import Container
 from physrisk.data.pregenerated_hazard_model import ZarrHazardModel
 from physrisk.hazard_models.core_hazards import get_default_source_paths
-from physrisk.kernel.assets import Asset, ManufacturingAsset
+from physrisk.kernel.assets import Asset, ManufacturingAsset, OEDAsset
 from physrisk.kernel.financial_model import (
     DefaultFinancialModel,
     FinancialDataProvider,
@@ -31,7 +31,11 @@ from physrisk.kernel.hazards import (
     Wind,
 )
 from physrisk.kernel.impact import AssetImpactResult, ImpactKey
-from physrisk.kernel.impact_aggregator import aggregate_impacts
+from physrisk.kernel.impact_aggregator import (
+    SimpleEventInsuranceProvider,
+    aggregate_impacts,
+)
+from physrisk.kernel.insurance_model import SectoralInsuranceData
 from physrisk.kernel.impact_distrib import ImpactDistrib
 from physrisk.kernel.risk import QuantityType, RiskQuantityKey
 from physrisk.vulnerability_models.vulnerability import VulnerabilityModelsFactory
@@ -125,6 +129,80 @@ def test_impact_aggregation():
     )
     np.testing.assert_allclose(mean_damage_mc, 0.000260859179)
     np.testing.assert_allclose(mean_damage_mc, mean_damage_exact, rtol=0.02)
+
+
+def test_impact_aggregation_multiple_portfolios():
+    """Assets tagged with different 'aggregation_id' values should produce separate,
+    independently-normalised portfolio-level results (keyed by RiskQuantityKey.agg_id),
+    rather than being pooled into a single portfolio total.
+    """
+    impact_bin_edges = np.array([0.1, 0.2, 0.4, 0.8])
+    impact_probabilities = np.array(
+        [(1.0 - 0.5) / 100, (0.5 - 0.1) / 100.0, 0.1 / 100.0]
+    )
+
+    # portfolio A's assets have 10x the impact severity of portfolio B's
+    portfolio_scale = {"A": 10.0, "B": 1.0}
+    impacts: Dict[ImpactKey, list[AssetImpactResult]] = {}
+    n_assets = 4000
+    for i in range(n_assets):
+        portfolio = "A" if i % 2 == 0 else "B"
+        asset_impact = AssetImpactResult(
+            impact=ImpactDistrib(
+                RiverineInundation,
+                impact_bin_edges.copy(),
+                (impact_probabilities * portfolio_scale[portfolio]).copy(),
+                "",
+            )
+        )
+        impacts[
+            ImpactKey(
+                asset=Asset(
+                    id=f"asset_{i}",
+                    latitude=0.0,
+                    longitude=0.0,
+                    aggregation_id=portfolio,
+                ),
+                hazard_type=RiverineInundation,
+                scenario="historical",
+                key_year=None,
+            )
+        ] = [asset_impact]
+
+    financial_model = DefaultFinancialModel(
+        data_provider=TestFinancialDataProvider(), downtime_config=[]
+    )
+
+    results = aggregate_impacts(impacts, financial_model, "historical", None)
+
+    # no pooled 'all portfolios' total should be produced when every asset has an aggregation_id
+    assert (
+        RiskQuantityKey(QuantityType.DAMAGE, None, None, RiverineInundation)
+        not in results
+    )
+
+    for portfolio in portfolio_scale:
+        damage = results[
+            RiskQuantityKey(QuantityType.DAMAGE, None, portfolio, RiverineInundation)
+        ]
+        # all assets have equal TIV, so mean damage should equal the plain average of
+        # mean_impact() over just that portfolio's assets, not the whole population
+        mean_damage_exact = np.mean(
+            [
+                i[0].impact.mean_impact()
+                for k, i in impacts.items()
+                if k.asset.aggregation_id == portfolio
+            ]
+        )
+        np.testing.assert_allclose(damage.mean, mean_damage_exact, rtol=0.03)
+
+    damage_a = results[
+        RiskQuantityKey(QuantityType.DAMAGE, None, "A", RiverineInundation)
+    ]
+    damage_b = results[
+        RiskQuantityKey(QuantityType.DAMAGE, None, "B", RiverineInundation)
+    ]
+    np.testing.assert_allclose(damage_a.mean / damage_b.mean, 10.0, rtol=0.05)
 
 
 def test_impact_aggregation_end_to_end():
@@ -628,3 +706,94 @@ def test_impact_aggregation_multi_hazard():
     assert (
         RiskQuantityKey(QuantityType.REVENUE_LOSS, None, None, ChronicHeat) in results
     )
+
+
+def test_simple_event_insurance_provider():
+    """SimpleEventInsuranceProvider returns claim payments consistent with uptake by hazard and occupancy code.
+
+    Deductable is set to 0 and limit far above the unit loss used in this test, so that the claim payment for
+    a given (asset, hazard) reduces to an is_insured indicator (loss if insured, 0 if not). This lets us test
+    the underlying uptake/correlation behaviour directly, as the previous version of this test did via a
+    boolean is_insured mask.
+
+    3 assets with different occupancy codes and uptake rules:
+      asset_0 (occ=1000): flood uptake=0.0 → always insured; fire uptake=1.0 → never insured
+      asset_1 (occ=2000): flood uptake=1.0 → never insured; fire uptake=0.0 → always insured
+      asset_2 (occ=3000): flood uptake=0.5, fire uptake=0.5 → ~50% insured for each
+    """
+    assets = [
+        OEDAsset(id="asset_0", occupancy_code=1000, latitude=0.0, longitude=0.0),
+        OEDAsset(id="asset_1", occupancy_code=2000, latitude=0.0, longitude=0.0),
+        OEDAsset(id="asset_2", occupancy_code=3000, latitude=0.0, longitude=0.0),
+    ]
+
+    uptake_table = {
+        (1000, RiverineInundation): 0.0,
+        (1000, Fire): 1.0,
+        (2000, RiverineInundation): 1.0,
+        (2000, Fire): 0.0,
+        (3000, RiverineInundation): 0.5,
+        (3000, Fire): 0.2,
+    }
+
+    def mock_insurance(
+        asset: Asset, hazard_type: type, impact_type: QuantityType
+    ) -> SectoralInsuranceData:
+        uptake = uptake_table[(cast(OEDAsset, asset).occupancy_code, hazard_type)]
+        return SectoralInsuranceData(uptake=uptake, deductable=0.0, limit=1.0)
+
+    class _ConstantFinancialDataProvider:
+        def revenue_attributable_to_asset(self, asset: Asset, currency: str) -> float:
+            return 1.0e9
+
+        def total_insurable_value(self, asset: Asset, currency: str) -> float:
+            return 1.0e9
+
+    provider = SimpleEventInsuranceProvider(
+        insurance=mock_insurance,
+        financials=_ConstantFinancialDataProvider(),
+        all_acute_impacted_assets=assets,
+    )
+    n_events = 10000
+    generator = np.random.default_rng(seed=111)
+    loss = np.ones(n_events)
+    fire_batch: list[np.ndarray] = []
+    for _batch in range(2):
+        claim_payment = provider.next_claim_payments_in_batch(n_events, generator)
+
+        def is_insured(
+            hazard_type: type, asset_idx: int, claim_payment=claim_payment
+        ) -> np.ndarray:
+            return claim_payment(loss, asset_idx, hazard_type, QuantityType.DAMAGE) > 0
+
+        # asset_0, flood: uptake=0.0 → never True
+        assert not np.any(is_insured(RiverineInundation, 0))
+
+        # asset_0, fire: uptake=1.0 → always True
+        assert np.all(is_insured(Fire, 0))
+
+        # asset_1, flood: uptake=1.0 → always True
+        assert np.all(is_insured(RiverineInundation, 1))
+
+        # asset_1, fire: uptake=0.0 → never True
+        assert not np.any(is_insured(Fire, 1))
+
+        # asset_2, flood: uptake=0.5 → ~50% True
+        np.testing.assert_allclose(
+            np.mean(is_insured(RiverineInundation, 2)), 0.5, atol=0.02
+        )
+
+        # behaviour we want is that probability of fire uptake, given flood uptake is 0.2 / 0.5
+        np.testing.assert_allclose(np.mean(is_insured(Fire, 2)), 0.2, atol=0.02)
+
+        # the probability of fire insurance given flood insurance is uptake_fire / uptake_inundation = 0.4 in this model, not 0.2
+        np.testing.assert_allclose(
+            np.mean(is_insured(Fire, 2) & is_insured(RiverineInundation, 2))
+            / np.mean(is_insured(RiverineInundation, 2)),
+            0.4,
+            atol=0.02,
+        )
+
+        fire_batch.append(is_insured(Fire, 2).copy())
+
+    np.testing.assert_allclose(np.mean(fire_batch[0] & fire_batch[1]), 0.0, atol=0.04)
