@@ -86,6 +86,15 @@ class RequestWeights:
 
 
 class JBAHazardModel(HazardModel):
+    # GMSLR buckets available for the storm-surge backfill, in metres of global mean sea
+    # level rise - see the comment above _gmslr_interpolation_weights.
+    _GMSLR_BUCKET_METRES: Tuple[Tuple[str, float], ...] = (
+        ("GMSLR1", 0.1),
+        ("GMSLR2", 0.2),
+        ("GMSLR4", 0.4),
+        ("GMSLR8", 0.8),
+    )
+
     def __init__(
         self,
         cache_store: GeometryH3BasedCache,
@@ -97,6 +106,7 @@ class JBAHazardModel(HazardModel):
         restrict_coverage: bool = False,
         only_request_required: bool = False,
         default_buffer: int = 10,
+        backfill_storm_surge_slr: bool = True,
     ):
         """JBAHazardModel retrieves data via the JBA API.
         https://api.jbarisk.com/docs/index.html
@@ -118,6 +128,10 @@ class JBAHazardModel(HazardModel):
             restrict_coverage (bool, optional): If True, restrict the number of scenarios for performance reasons.
             only_request_required (bool, optional): If True, request only scenarios and years required (i.e. not extra ones to cache)
             default_buffer (int, optional): Default buffer in metres to apply around points if no geometry provided. Defaults to 10.
+            backfill_storm_surge_slr (bool, optional): If True, backfill STSU_U (storm surge) for future
+                scenarios via JBA's GMSLR API, since the main flood-depths API does not yet return it for
+                future climates. Interim measure: remove once JBA populate STSU_U for future scenarios
+                directly. Defaults to True.
         """
         self.cache_store = cache_store
         self.credentials = (
@@ -142,6 +156,21 @@ class JBAHazardModel(HazardModel):
             2080: "2066-2095",
             2100: "2086-2115",
         }
+        # median global mean sea level rise, in metres relative to a 1995-2014-ish
+        # baseline, by (scenario, year). Used to backfill STSU_U (storm surge) for future
+        # scenarios by linear interpolation across the GMSLR buckets - see the comment
+        # above _gmslr_interpolation_weights.
+        self._gmslr_mapping: Dict[Tuple[str, int], float] = {
+            ("ssp126", 2030): 0.09,
+            ("ssp245", 2030): 0.09,
+            ("ssp585", 2030): 0.1,
+            ("ssp126", 2050): 0.19,
+            ("ssp245", 2050): 0.2,
+            ("ssp585", 2050): 0.23,
+            ("ssp126", 2080): 0.34,
+            ("ssp245", 2080): 0.4,
+            ("ssp585", 2080): 0.51,
+        }
         # for any API call we request these 15 scenarios
         self.pillar_years = [
             2030,
@@ -165,6 +194,22 @@ class JBAHazardModel(HazardModel):
         self.restrict_coverage = restrict_coverage
         self.only_request_required = only_request_required  # here in case needed in future. If true, only scenarios that are explicitly asked for are
         # included in API request; improves performance.
+        self.backfill_storm_surge_slr = backfill_storm_surge_slr
+        # interim storm-surge backfill: maps each jba_scenario string (e.g. "ssp585_2066-2095")
+        # to linear interpolation weights across the GMSLR buckets that bracket its expected
+        # sea level rise (self._gmslr_mapping). gmslr_buckets is the small fixed set of
+        # buckets that ever need fetching. See the comment above _gmslr_interpolation_weights.
+        self._jba_scenario_to_gmslr_weights: Dict[str, List[Tuple[str, float]]] = {
+            self.jba_scenario(scenario, year): self._gmslr_interpolation_weights(slr_m)
+            for (scenario, year), slr_m in self._gmslr_mapping.items()
+        }
+        self.gmslr_buckets: List[str] = sorted(
+            {
+                bucket
+                for weights in self._jba_scenario_to_gmslr_weights.values()
+                for bucket, _ in weights
+            }
+        )
 
     def check_requests(self, requests: Sequence[HazardDataRequest]):
         if any(
@@ -398,36 +443,55 @@ class JBAHazardModel(HazardModel):
                 )
         return prefix + "_" + range
 
-    async def flood_depth(
-        self, api_request: APIRequest, access_token: str, session: aiohttp.ClientSession
+    # --- storm surge (STSU_U) backfill for future climates --------------------------------
+    # JBA's main flood-depths API does not currently return STSU_U (storm surge) for future
+    # scenarios, only baseline/historical. In the interim we backfill it from JBA's separate
+    # GMSLR API (see storm_surge_slr below), which returns results for a single global mean
+    # sea level rise bucket rather than a scenario/year - so for a given scenario/year we
+    # linearly interpolate between the two GMSLR buckets (self._GMSLR_BUCKET_METRES) that
+    # bracket its expected sea level rise (self._gmslr_mapping). This whole block - this
+    # method, storm_surge_slr, _merge_storm_surge_slr, _interpolate_storm_surge_stats, the
+    # backfill_storm_surge_slr flag, and their use in get_hazard_data - can be deleted once
+    # JBA populate STSU_U for future scenarios directly in the main API.
+    def _gmslr_interpolation_weights(self, slr_m: float) -> List[Tuple[str, float]]:
+        """Linear interpolation weights across the GMSLR buckets (0.1m/0.2m/0.4m/0.8m) for
+        a given global mean sea level rise in metres. Clamps to the nearest bucket if slr_m
+        is outside the 0.1-0.8m range.
+        """
+        buckets = self._GMSLR_BUCKET_METRES
+        if slr_m <= buckets[0][1]:
+            return [(buckets[0][0], 1.0)]
+        if slr_m >= buckets[-1][1]:
+            return [(buckets[-1][0], 1.0)]
+        for (bucket_lo, m_lo), (bucket_hi, m_hi) in zip(buckets, buckets[1:]):
+            if m_lo <= slr_m <= m_hi:
+                weight_hi = (slr_m - m_lo) / (m_hi - m_lo)
+                return [(bucket_lo, 1 - weight_hi), (bucket_hi, weight_hi)]
+        return [(buckets[-1][0], 1.0)]  # unreachable given the checks above
+
+    async def _call_jba_flood_api(
+        self,
+        api_request: APIRequest,
+        access_token: str,
+        session: aiohttp.ClientSession,
+        req_ids: List[str],
+        params: Optional[Dict[str, str]],
+        log_label: str,
     ):
-        if len(api_request.spatial_keys) == 0:
-            return {}
+        """Shared POST + response-status handling for JBA's flood-depths-style endpoints,
+        used by both flood_depth and storm_surge_slr (which differ only in what
+        api_request.country_code means, whether CSTHs/baseline params are sent, and how
+        response items map back to cache keys - handled by each caller).
+
+        Returns the parsed JSON response (a list of per-location items) on success (HTTP
+        200), or a string describing the error - callers treat a string return as a
+        retryable failure. Raises ValueError on authentication failure (401/403), since
+        that's not something a per-location retry can fix.
+        """
         if self.credentials.jba_api_disabled():
             logger.error("JBA requests made but API calls disabled")
             raise ValueError("JBA requests made but API calls disabled")
-        # scenarios actually being requested from the API for this batch: used both to build the
-        # CSTHs request parameter and to know what keys to expect back in the response, so that the
-        # two stay in sync (e.g. under only_request_required, which narrows the scenario set).
-        requested_scenarios = (
-            self.jba_scenarios
-            if not self.only_request_required
-            else list(
-                set(
-                    k.jba_scenario
-                    for v in api_request.location_cache_keys.values()
-                    for k in v
-                    if k.jba_scenario != "historical"  # requested via "baseline" param
-                )
-            )
-        )
-        req_id_to_keys: Dict[str, List[JBACacheKey]] = {}
-        for k in api_request.spatial_keys:
-            req_id_to_keys[self.jba_request_id(k)] = [
-                JBACacheKey(s, k) for s in (["historical"] + requested_scenarios)
-            ]
-        req_ids = list(req_id_to_keys.keys())
-        country_code = api_request.country_code  # e.g. CN or FR
+        country_code = api_request.country_code  # e.g. CN, FR, or a GMSLR bucket
         # https://api.jbarisk.com/docs/1.2/index.html
         url = "https://api.jbarisk.com/flooddepths/" + country_code
         request = {
@@ -448,12 +512,8 @@ class JBAHazardModel(HazardModel):
                 )
             ],
         }
-        params = {
-            "CSTHs": ",".join(requested_scenarios),
-            "baseline": "true",
-        }
-        logger.debug("JBA request URL: " + url)
-        logger.debug("JBA request payload: " + json.dumps(request))
+        logger.debug(f"{log_label} request URL: " + url)
+        logger.debug(f"{log_label} request payload: " + json.dumps(request))
         headers = {"Authorization": f"Basic {access_token}"}
         proxies = self.credentials.proxies()
         response_dict = None
@@ -466,31 +526,70 @@ class JBAHazardModel(HazardModel):
                 headers=headers,  # , ssl=False can be used *in dev* if SSL verify issue
             ) as response:
                 response_dict = await response.json()
-                logger.debug("JBA response: " + json.dumps(response_dict))
+                logger.debug(f"{log_label} response: " + json.dumps(response_dict))
                 status = response.status
         except Exception:
             # network, proxy, or non-JSON response body errors land here, hence
             # use of logger.exception to ensure exception info is included.
-            logger.exception("JBA API raised exception")
+            logger.exception(f"{log_label} raised exception")
             return (
-                "JBA API request failed"
+                f"{log_label} request failed"
                 if response_dict is None
                 else str(response_dict)
             )
         if status in (401, 403):
             # not something a per-location retry can fix: fail loudly rather than
             # silently retrying every location and reporting misleading "no data" results.
-            logger.error(f"JBA API authentication failed (status {status})")
+            logger.error(f"{log_label} authentication failed (status {status})")
             raise ValueError(
-                f"JBA API authentication failed (status {status}); check credentials"
+                f"{log_label} authentication failed (status {status}); check credentials"
             )
         if status != 200:
-            logger.error(f"Response status {status}")
+            logger.error(f"{log_label} response status {status}")
             return str(response_dict)
+        return response_dict
+
+    async def flood_depth(
+        self, api_request: APIRequest, access_token: str, session: aiohttp.ClientSession
+    ):
+        if len(api_request.spatial_keys) == 0:
+            return {}
+        # scenarios actually being requested from the API for this batch: used both to build the
+        # CSTHs request parameter and to know what keys to expect back in the response, so that the
+        # two stay in sync (e.g. under only_request_required, which narrows the scenario set).
+        requested_scenarios = (
+            self.jba_scenarios
+            if not self.only_request_required
+            else list(
+                set(
+                    k.jba_scenario
+                    for v in api_request.location_cache_keys.values()
+                    for k in v
+                    if k.jba_scenario != "historical"  # requested via "baseline" param
+                )
+            )
+        )
+        req_id_to_keys: Dict[str, List[JBACacheKey]] = {
+            self.jba_request_id(k): [
+                JBACacheKey(s, k) for s in (["historical"] + requested_scenarios)
+            ]
+            for k in api_request.spatial_keys
+        }
+        req_ids = list(req_id_to_keys.keys())
+        response = await self._call_jba_flood_api(
+            api_request,
+            access_token,
+            session,
+            req_ids,
+            params={"CSTHs": ",".join(requested_scenarios), "baseline": "true"},
+            log_label="JBA flood-depth",
+        )
+        if isinstance(response, str):
+            return response
         try:
             # we expect results for all requested_scenarios and "stats"
             result = {}
-            for item in response_dict:
+            for item in response:
                 for cache_key in req_id_to_keys[item["id"]]:
                     key = (
                         "stats"
@@ -501,10 +600,51 @@ class JBAHazardModel(HazardModel):
             return result
         except Exception:
             ids = ",".join(req_ids)
-            logger.error(f"Unexpected response for URL {url} (request IDs: {ids})")
-            # logger.exception("") # do not include exception info
-            # as we assume useful info is in response.
-            return str(response_dict)
+            logger.error(
+                f"Unexpected flood-depth response for {api_request.country_code} "
+                f"(request IDs: {ids})"
+            )
+            # no logger.exception here - we assume useful info is in the response.
+            return str(response)
+
+    async def storm_surge_slr(
+        self, api_request: APIRequest, access_token: str, session: aiohttp.ClientSession
+    ):
+        """Backfill for STSU_U (storm surge) under future climates: calls JBA's GMSLR API,
+        which returns results for a single global mean sea level rise bucket (encoded via
+        api_request.country_code, e.g. "GMSLR4", instead of a real country) rather than a
+        scenario/year - so there is one cache key per location instead of one per scenario,
+        and no CSTHs/baseline params. Part of the interim storm-surge backfill - see the
+        comment above _gmslr_interpolation_weights.
+        """
+        if len(api_request.spatial_keys) == 0:
+            return {}
+        bucket = api_request.country_code  # e.g. "GMSLR4"
+        req_id_to_key: Dict[str, JBACacheKey] = {
+            self.jba_request_id(k): JBACacheKey(bucket, k)
+            for k in api_request.spatial_keys
+        }
+        req_ids = list(req_id_to_key.keys())
+        response = await self._call_jba_flood_api(
+            api_request,
+            access_token,
+            session,
+            req_ids,
+            params=None,
+            log_label="JBA GMSLR",
+        )
+        if isinstance(response, str):
+            return response
+        try:
+            result = {}
+            for item in response:
+                cache_key = req_id_to_key[item["id"]]
+                result[cache_key] = {"stats": item["stats"]}
+            return result
+        except Exception:
+            ids = ",".join(req_ids)
+            logger.error(f"Unexpected GMSLR response for {bucket} (request IDs: {ids})")
+            return str(response)
 
     def _identify_api_requests(
         self,
@@ -584,14 +724,40 @@ class JBAHazardModel(HazardModel):
                     async def request_single(request: APIRequest):
                         nonlocal check_total
                         async with semaphore:
-                            responses = await self.flood_depth(
-                                request, access_token, session
+                            # interim storm-surge backfill (see _gmslr_interpolation_weights):
+                            # fetch the main flood-depth data and all GMSLR bucket data for this batch's
+                            # locations concurrently, then merge before caching. The enriched
+                            # result is cached as a normal flood-depth entry afterwards, so no
+                            # separate GMSLR cache is needed.
+                            slr_requests = (
+                                [
+                                    APIRequest(
+                                        spatial_keys=request.spatial_keys,
+                                        latitudes=request.latitudes,
+                                        longitudes=request.longitudes,
+                                        geometries=request.geometries,
+                                        country_code=bucket,
+                                        location_cache_keys={},
+                                    )
+                                    for bucket in self.gmslr_buckets
+                                ]
+                                if self.backfill_storm_surge_slr
+                                else []
+                            )
+                            responses, *slr_batches = await asyncio.gather(
+                                self.flood_depth(request, access_token, session),
+                                *(
+                                    self.storm_surge_slr(r, access_token, session)
+                                    for r in slr_requests
+                                ),
                             )
                             check_total += len(request.spatial_keys)
                             if isinstance(responses, str):
                                 # a string indicates an error
                                 reruns.append(request)
                             else:
+                                if slr_batches:
+                                    self._merge_storm_surge_slr(responses, slr_batches)
                                 self.cache_store.setitems(
                                     {
                                         self.jba_cache_id(k): json.dumps(v)
@@ -644,6 +810,67 @@ class JBAHazardModel(HazardModel):
             logger.info(f"Check: {check_total} requests made")
             logger.info(f"Check: {len(single_api_requests)} reruns")
         return cached_responses
+
+    def _merge_storm_surge_slr(
+        self, responses: Dict[JBACacheKey, Dict], slr_batches: List
+    ):
+        """Backfills STSU_U into responses (in place) from freshly-fetched slr_batches, for
+        any cache key that doesn't already have it populated. STSU_U is linearly
+        interpolated across the GMSLR buckets that bracket the cache key's expected sea
+        level rise - see the comment above _gmslr_interpolation_weights. The enriched
+        responses are cached as normal flood-depth entries afterwards, so no separate
+        GMSLR cache is needed.
+        """
+        slr_stats_by_key: Dict[JBACacheKey, Dict] = {}
+        for slr_batch in slr_batches:
+            if isinstance(slr_batch, str):
+                logger.error(f"GMSLR backfill request failed: {slr_batch}")
+                continue
+            for slr_key, value in slr_batch.items():
+                stats = (value or {}).get("stats") or {}
+                if "STSU_U" in stats:
+                    slr_stats_by_key[slr_key] = stats["STSU_U"]
+        for cache_key, resp in responses.items():
+            weights = self._jba_scenario_to_gmslr_weights.get(cache_key.jba_scenario)
+            if not weights:
+                continue
+            stats = resp.get("stats") or {}
+            if stats.get("STSU_U"):
+                continue  # JBA already returned it - nothing to backfill
+            weighted_stsu = [
+                (slr_stats_by_key[slr_key], weight)
+                for bucket, weight in weights
+                if (slr_key := JBACacheKey(bucket, cache_key.spatial_key))
+                in slr_stats_by_key
+            ]
+            if len(weighted_stsu) != len(weights):
+                continue  # a bracketing bucket failed to fetch - skip rather than guess
+            stats["STSU_U"] = self._interpolate_storm_surge_stats(weighted_stsu)
+            resp["stats"] = stats
+
+    def _interpolate_storm_surge_stats(
+        self, weighted_stats: List[Tuple[Dict, float]]
+    ) -> Dict:
+        """Linearly combines one or two STSU_U stats blocks (each e.g. {"rp_20": {"max20":
+        0.5, ...}, ...}) according to the given weights. Part of the interim storm-surge
+        backfill - see the comment above _gmslr_interpolation_weights.
+        """
+        if len(weighted_stats) == 1:
+            return weighted_stats[0][0]
+        rp_keys = set().union(*(stats.keys() for stats, _ in weighted_stats))
+        combined: Dict[str, Dict[str, float]] = {}
+        for rp_key in rp_keys:
+            fields = set().union(
+                *(stats.get(rp_key, {}).keys() for stats, _ in weighted_stats)
+            )
+            combined[rp_key] = {
+                field: sum(
+                    stats.get(rp_key, {}).get(field, 0) * weight
+                    for stats, weight in weighted_stats
+                )
+                for field in fields
+            }
+        return combined
 
     def _process_response(self, request: HazardDataRequest, response: Dict):
         if request.hazard_type == RiverineInundation:
