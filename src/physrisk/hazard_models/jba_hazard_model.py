@@ -406,10 +406,25 @@ class JBAHazardModel(HazardModel):
         if self.credentials.jba_api_disabled():
             logger.error("JBA requests made but API calls disabled")
             raise ValueError("JBA requests made but API calls disabled")
-        req_id_to_keys: Dict[str, List[JBACacheKey]] = defaultdict(list)
+        # scenarios actually being requested from the API for this batch: used both to build the
+        # CSTHs request parameter and to know what keys to expect back in the response, so that the
+        # two stay in sync (e.g. under only_request_required, which narrows the scenario set).
+        requested_scenarios = (
+            self.jba_scenarios
+            if not self.only_request_required
+            else list(
+                set(
+                    k.jba_scenario
+                    for v in api_request.location_cache_keys.values()
+                    for k in v
+                    if k.jba_scenario != "historical"  # requested via "baseline" param
+                )
+            )
+        )
+        req_id_to_keys: Dict[str, List[JBACacheKey]] = {}
         for k in api_request.spatial_keys:
             req_id_to_keys[self.jba_request_id(k)] = [
-                JBACacheKey(s, k) for s in (["historical"] + self.jba_scenarios)
+                JBACacheKey(s, k) for s in (["historical"] + requested_scenarios)
             ]
         req_ids = list(req_id_to_keys.keys())
         country_code = api_request.country_code  # e.g. CN or FR
@@ -434,25 +449,15 @@ class JBAHazardModel(HazardModel):
             ],
         }
         params = {
-            "CSTHs": ",".join(
-                self.jba_scenarios
-                if not self.only_request_required
-                else list(
-                    set(
-                        k.jba_scenario
-                        for v in api_request.location_cache_keys.values()
-                        for k in v
-                    )
-                )
-            ),
+            "CSTHs": ",".join(requested_scenarios),
             "baseline": "true",
         }
         logger.debug("JBA request URL: " + url)
         logger.debug("JBA request payload: " + json.dumps(request))
         headers = {"Authorization": f"Basic {access_token}"}
         proxies = self.credentials.proxies()
+        response_dict = None
         try:
-            response_dict = None
             async with session.post(
                 url=url,
                 json=request,
@@ -462,40 +467,44 @@ class JBAHazardModel(HazardModel):
             ) as response:
                 response_dict = await response.json()
                 logger.debug("JBA response: " + json.dumps(response_dict))
-                if response.status == 200:
-                    try:
-                        # we expect results for all self.jba_scenarios and "stats"
-                        result = {}
-                        for item in response_dict:
-                            for cache_key in req_id_to_keys[item["id"]]:
-                                key = (
-                                    "stats"
-                                    if cache_key.jba_scenario == "historical"
-                                    else cache_key.jba_scenario
-                                )
-                                result[cache_key] = {"stats": item[key]}
-                        return result
-                    except Exception:
-                        ids = ",".join(id for id in req_ids)
-                        logging.error(
-                            f"Unexpected response for URL {url} (request IDs: {ids})"
-                        )
-                        # logging.exception("") # do not include exception info
-                        # as we assume useful info is in response.
-                        return str(response_dict)
-                else:
-                    # Request failed
-                    logging.error(f"Response status {response.status}")
-                    return str(response_dict)
+                status = response.status
         except Exception:
-            # proxy or authentication errors would be expected to come here, hence
-            # use of logging.exception to ensure exception info is included.
-            logging.exception("JBA API raised exception")
+            # network, proxy, or non-JSON response body errors land here, hence
+            # use of logger.exception to ensure exception info is included.
+            logger.exception("JBA API raised exception")
             return (
                 "JBA API request failed"
                 if response_dict is None
                 else str(response_dict)
             )
+        if status in (401, 403):
+            # not something a per-location retry can fix: fail loudly rather than
+            # silently retrying every location and reporting misleading "no data" results.
+            logger.error(f"JBA API authentication failed (status {status})")
+            raise ValueError(
+                f"JBA API authentication failed (status {status}); check credentials"
+            )
+        if status != 200:
+            logger.error(f"Response status {status}")
+            return str(response_dict)
+        try:
+            # we expect results for all requested_scenarios and "stats"
+            result = {}
+            for item in response_dict:
+                for cache_key in req_id_to_keys[item["id"]]:
+                    key = (
+                        "stats"
+                        if cache_key.jba_scenario == "historical"
+                        else cache_key.jba_scenario
+                    )
+                    result[cache_key] = {"stats": item[key]}
+            return result
+        except Exception:
+            ids = ",".join(req_ids)
+            logger.error(f"Unexpected response for URL {url} (request IDs: {ids})")
+            # logger.exception("") # do not include exception info
+            # as we assume useful info is in response.
+            return str(response_dict)
 
     def _identify_api_requests(
         self,
@@ -597,7 +606,17 @@ class JBAHazardModel(HazardModel):
 
                     await asyncio.gather(*(request_single(req) for req in api_requests))
 
-            run(gather_requests(api_requests), loop)
+            def run_checked(coro):
+                # run() reports coroutine exceptions by returning the exception
+                # instance rather than raising it; re-raise here so that e.g.
+                # authentication failures in flood_depth fail loudly instead of
+                # being silently dropped.
+                result = run(coro, loop)
+                if isinstance(result, Exception):
+                    raise result
+                return result
+
+            run_checked(gather_requests(api_requests))
             # for failed batches we run again, but as single requests
             # this is needed because the JBA API will fail for all locations
             # if a single one is out of bounds (e.g. off-shore wind farm)
@@ -621,7 +640,7 @@ class JBAHazardModel(HazardModel):
                 )
             ]
             if len(single_api_requests) > 0:
-                run(gather_requests(single_api_requests), loop)
+                run_checked(gather_requests(single_api_requests))
             logger.info(f"Check: {check_total} requests made")
             logger.info(f"Check: {len(single_api_requests)} reruns")
         return cached_responses
