@@ -262,16 +262,21 @@ class JBAHazardModel(HazardModel):
                 requests_by_location[spatial_key].append(item)
                 if item.scenario != "historical":
                     all_years.add(item.year)
-            # JBA requires a 2-letter country code per request (at time of writing),
-            # so it is necessary to geocode.
-            lats, lons = (
-                [r[0].latitude for r in requests_by_location.values()],
-                [r[0].longitude for r in requests_by_location.values()],
-            )
-            countries = [
-                country_mapping.get(c, c)
-                for c in self.geocoder.get_countries(lats, lons)
-            ]
+            # JBA requires a 2-letter country code per request (at time of writing), so it
+            # is normally necessary to geocode - except when the storm-surge backfill is
+            # enabled, in which case we use JBA's worldwide model ("WR") for every location
+            # instead, skipping geocoding entirely.
+            if self.backfill_storm_surge_slr:
+                countries = ["WR"] * len(requests_by_location)
+            else:
+                lats, lons = (
+                    [r[0].latitude for r in requests_by_location.values()],
+                    [r[0].longitude for r in requests_by_location.values()],
+                )
+                countries = [
+                    country_mapping.get(c, c)
+                    for c in self.geocoder.get_countries(lats, lons)
+                ]
             # note a single cache entry can provide information for multiple requests, because each entry contains
             # information about different hazards, or because points are close.
             # for interpolation, the list of pillar years for different requested years is calculated
@@ -517,6 +522,7 @@ class JBAHazardModel(HazardModel):
         headers = {"Authorization": f"Basic {access_token}"}
         proxies = self.credentials.proxies()
         response_dict = None
+        status = None
         try:
             async with session.post(
                 url=url,
@@ -525,12 +531,17 @@ class JBAHazardModel(HazardModel):
                 proxy=proxies["https"],
                 headers=headers,  # , ssl=False can be used *in dev* if SSL verify issue
             ) as response:
-                response_dict = await response.json()
-                logger.debug(f"{log_label} response: " + json.dumps(response_dict))
+                # capture status before attempting to parse the body: auth failures often
+                # come back with a non-JSON body, and we still need the status in that case.
                 status = response.status
+                try:
+                    response_dict = await response.json()
+                    logger.debug(f"{log_label} response: " + json.dumps(response_dict))
+                except Exception:
+                    logger.exception(f"{log_label} response body was not valid JSON")
         except Exception:
-            # network, proxy, or non-JSON response body errors land here, hence
-            # use of logger.exception to ensure exception info is included.
+            # network or proxy errors, or failure to establish the response, land here,
+            # hence use of logger.exception to ensure exception info is included.
             logger.exception(f"{log_label} raised exception")
             return (
                 f"{log_label} request failed"
@@ -544,6 +555,11 @@ class JBAHazardModel(HazardModel):
             raise ValueError(
                 f"{log_label} authentication failed (status {status}); check credentials"
             )
+        if response_dict is None:
+            logger.error(
+                f"{log_label} response status {status} but body was not valid JSON"
+            )
+            return f"{log_label} request failed (status {status})"
         if status != 200:
             logger.error(f"{log_label} response status {status}")
             return str(response_dict)
