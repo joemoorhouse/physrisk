@@ -78,10 +78,6 @@ class APIRequest:
         str, List[JBACacheKey]
     ]  # for each spatial_keys list of cache keys that is requested
 
-    # this is requested for all jba_scenarios systematically
-    def request_count(self):
-        return len(self.cache_keys)
-
 
 @dataclass
 class RequestWeights:
@@ -309,20 +305,34 @@ class JBAHazardModel(HazardModel):
                 if len(resps) == 1:
                     result[req_weight.request] = resps[0]
                 elif len(resps) == 2:
-                    if not isinstance(
-                        resps[0], HazardEventDataResponse
-                    ) or not isinstance(resps[1], HazardEventDataResponse):
+                    weight0, weight1 = (
+                        req_weight.weights[0][1],
+                        req_weight.weights[1][1],
+                    )
+                    if isinstance(resps[0], HazardEventDataResponse) and isinstance(
+                        resps[1], HazardEventDataResponse
+                    ):
+                        result[req_weight.request] = HazardEventDataResponse(
+                            resps[0].return_periods,
+                            resps[0].intensities * weight0
+                            + resps[1].intensities * weight1,
+                            units="m",
+                            path="jba",
+                        )
+                    elif isinstance(
+                        resps[0], HazardParameterDataResponse
+                    ) and isinstance(resps[1], HazardParameterDataResponse):
+                        result[req_weight.request] = HazardParameterDataResponse(
+                            resps[0].parameters * weight0
+                            + resps[1].parameters * weight1,
+                            resps[0].param_defns,
+                            units=resps[0].units,
+                            path="jba",
+                        )
+                    else:
                         result[req_weight.request] = HazardDataFailedResponse(
                             ValueError("no data returned")
                         )
-                        continue
-                    result[req_weight.request] = HazardEventDataResponse(
-                        resps[0].return_periods,
-                        resps[0].intensities * req_weight.weights[0][1]
-                        + resps[1].intensities * req_weight.weights[1][1],
-                        units="m",
-                        path="jba",
-                    )
             failures = [
                 r for r in result.values() if isinstance(r, HazardDataFailedResponse)
             ]
@@ -524,7 +534,7 @@ class JBAHazardModel(HazardModel):
             geoms = [r.geometry for r in first_req]
             batches.append(
                 APIRequest(
-                    location_cache_keys=location_cache_keys,
+                    location_cache_keys={k: location_cache_keys[k] for k in req_keys},
                     spatial_keys=req_keys,
                     latitudes=lats,
                     longitudes=lons,
@@ -598,7 +608,9 @@ class JBAHazardModel(HazardModel):
                     longitudes=[lon],
                     geometries=[geometry],
                     country_code=rerun.country_code,
-                    location_cache_keys=rerun.location_cache_keys,
+                    location_cache_keys={
+                        spatial_key: rerun.location_cache_keys[spatial_key]
+                    },
                 )
                 for rerun in reruns
                 for spatial_key, lat, lon, geometry in zip(
@@ -629,7 +641,7 @@ class JBAHazardModel(HazardModel):
         if response["stats"] is None:
             return HazardDataFailedResponse(ValueError("no data returned"))
         elif request.indicator_id == "flood_sop":
-            sop = response["stats"].get("FLRF_U", {}).get("sop", 0)
+            sop = response["stats"].get(tag, {}).get("sop", 0)
             return HazardParameterDataResponse(
                 [sop, sop], units="years", path=path
             )  # min and max: in this case just a single value
