@@ -726,8 +726,15 @@ class JBAHazardModel(HazardModel):
         # which uses the AsyncFileSystem of fsspec.
         loop = get_loop()
         cached_responses = {}
+        # each in-flight batch fans out to 1 flood-depth request plus one GMSLR request per
+        # bucket (see request_single below) when the storm-surge backfill is enabled, all to
+        # the same host - so the connection pool needs to be sized for that fan-out, not just
+        # for concurrent_requests batches, or most of those requests just queue for a slot.
+        requests_per_batch = (
+            1 + len(self.gmslr_buckets) if self.backfill_storm_surge_slr else 1
+        )
         with aiohttp.TCPConnector(
-            limit_per_host=concurrent_requests, loop=loop
+            limit_per_host=concurrent_requests * requests_per_batch, loop=loop
         ) as conn:
             reruns: List[APIRequest] = []
 
@@ -873,7 +880,12 @@ class JBAHazardModel(HazardModel):
         """
         if len(weighted_stats) == 1:
             return weighted_stats[0][0]
-        rp_keys = set().union(*(stats.keys() for stats, _ in weighted_stats))
+        # sorted ascending by return period: downstream code (_process_response) builds
+        # the return_periods/intensities arrays straight from this dict's iteration order.
+        rp_keys = sorted(
+            set().union(*(stats.keys() for stats, _ in weighted_stats)),
+            key=lambda rp_key: float(rp_key[3:]),
+        )
         combined: Dict[str, Dict[str, float]] = {}
         for rp_key in rp_keys:
             fields = set().union(

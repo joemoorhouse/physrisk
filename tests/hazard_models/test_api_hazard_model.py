@@ -1,11 +1,18 @@
+from unittest.mock import patch
+
+import pytest
 import shapely.wkt
-from physrisk.kernel.hazard_model import HazardDataRequest
-from physrisk.kernel.hazards import PluvialInundation, RiverineInundation
+from physrisk.kernel.hazard_model import HazardDataRequest, HazardEventDataResponse
+from physrisk.kernel.hazards import (
+    CoastalInundation,
+    PluvialInundation,
+    RiverineInundation,
+)
 
 from physrisk.data.geocode import Geocoder
 from physrisk.hazard_models.credentials_provider import EnvCredentialsProvider
 from physrisk.hazard_models.hazard_cache import GeometryH3BasedCache, MemoryStore
-from physrisk.hazard_models.jba_hazard_model import JBAHazardModel
+from physrisk.hazard_models.jba_hazard_model import JBACacheKey, JBAHazardModel
 
 from tests.conftest import cache_store_tests
 
@@ -101,3 +108,133 @@ def test_jba_hazard_model(load_credentials, hazard_dir, update_inputs):
         ]
         response = model.get_hazard_data(requests_riv + requests_pluv)
         assert response is not None
+
+
+def _stats_block(depth: float):
+    # several return periods, deliberately not in a set-hash-friendly order, so a
+    # regression that stops sorting the merged STSU_U return periods gets caught
+    return {
+        "rp_1500": {"max1500": depth * 6},
+        "rp_20": {"max20": depth},
+        "rp_500": {"max500": depth * 5},
+        "rp_50": {"max50": depth * 1.5},
+        "rp_200": {"max200": depth * 3},
+        "rp_100": {"max100": depth * 2},
+    }
+
+
+async def _fake_flood_depth_no_future_storm_surge(
+    self, api_request, access_token, session
+):
+    """Mocks JBA's flood-depths API as it behaves today: FLRF_U/FLSW_U/STSU_U are all
+    returned for the historical baseline, but STSU_U (storm surge) is missing for every
+    future scenario - the gap that the GMSLR backfill is meant to fill."""
+    result = {}
+    for spatial_key in api_request.spatial_keys:
+        for jba_scenario in ["historical"] + self.jba_scenarios:
+            is_historical = jba_scenario == "historical"
+            result[JBACacheKey(jba_scenario, spatial_key)] = {
+                "stats": {
+                    "FLRF_U": _stats_block(0.5),
+                    "STSU_U": _stats_block(0.5) if is_historical else {},
+                }
+            }
+    return result
+
+
+async def _fake_storm_surge_slr(self, api_request, access_token, session):
+    """Mocks JBA's GMSLR API: each bucket returns a distinct storm-surge depth so that
+    interpolation between buckets can be verified precisely."""
+    bucket_depths_m = {"GMSLR1": 1.0, "GMSLR2": 2.0, "GMSLR4": 4.0, "GMSLR8": 8.0}
+    depth = bucket_depths_m[api_request.country_code]
+    return {
+        JBACacheKey(api_request.country_code, spatial_key): {
+            "stats": {"STSU_U": _stats_block(depth)}
+        }
+        for spatial_key in api_request.spatial_keys
+    }
+
+
+def test_coastal_storm_surge_backfill():
+    """Storm surge (STSU_U) is not yet returned by JBA for future scenarios; the model
+    backfills it from JBA's separate GMSLR API, linearly interpolated between the two
+    buckets that bracket the scenario/year's expected sea level rise. ssp585/2050 maps to
+    0.23m, which falls between the GMSLR2 (0.2m) and GMSLR4 (0.4m) buckets, giving weights
+    of 0.85 and 0.15 respectively."""
+    latitude, longitude = 43.264209, 5.386365
+    point = shapely.wkt.loads(f"POINT({longitude} {latitude})")
+    model = JBAHazardModel(
+        GeometryH3BasedCache(MemoryStore()),
+        credentials=EnvCredentialsProvider(disable_api_calls=False),
+        max_requests=1000,
+        restrict_coverage=True,  # fewer scenarios requested, keeps the mock small
+    )
+    coastal_request = HazardDataRequest(
+        hazard_type=CoastalInundation,
+        longitude=longitude,
+        latitude=latitude,
+        indicator_id="flood_depth",
+        scenario="ssp585",
+        year=2050,
+        geometry=point,
+    )
+    riverine_request = HazardDataRequest(
+        hazard_type=RiverineInundation,
+        longitude=longitude,
+        latitude=latitude,
+        indicator_id="flood_depth",
+        scenario="ssp585",
+        year=2050,
+        geometry=point,
+    )
+    historical_request = HazardDataRequest(
+        hazard_type=CoastalInundation,
+        longitude=longitude,
+        latitude=latitude,
+        indicator_id="flood_depth",
+        scenario="historical",
+        year=2020,
+        geometry=point,
+    )
+
+    with (
+        patch.object(
+            JBAHazardModel, "flood_depth", _fake_flood_depth_no_future_storm_surge
+        ),
+        patch.object(JBAHazardModel, "storm_surge_slr", _fake_storm_surge_slr),
+    ):
+        result = model.get_hazard_data(
+            [coastal_request, riverine_request, historical_request]
+        )
+
+    coastal_response = result[coastal_request]
+    assert isinstance(coastal_response, HazardEventDataResponse)
+    # return periods from the merged/interpolated STSU_U must come out in ascending
+    # order - a regression here previously broke downstream return-period interpolation
+    assert list(coastal_response.return_periods) == sorted(
+        coastal_response.return_periods
+    )
+    coastal_by_rp = dict(
+        zip(coastal_response.return_periods, coastal_response.intensities)
+    )
+    assert coastal_by_rp[20.0] == pytest.approx(0.85 * 2.0 + 0.15 * 4.0)
+    assert coastal_by_rp[100.0] == pytest.approx(0.85 * 4.0 + 0.15 * 8.0)
+    assert coastal_by_rp[1500.0] == pytest.approx(0.85 * 12.0 + 0.15 * 24.0)
+
+    # riverine data (FLRF_U) is untouched by the storm-surge backfill
+    riverine_response = result[riverine_request]
+    assert isinstance(riverine_response, HazardEventDataResponse)
+    riverine_by_rp = dict(
+        zip(riverine_response.return_periods, riverine_response.intensities)
+    )
+    assert riverine_by_rp[20.0] == pytest.approx(0.5)
+    assert riverine_by_rp[100.0] == pytest.approx(1.0)
+
+    # historical STSU_U comes straight from the main API, not the GMSLR backfill
+    historical_response = result[historical_request]
+    assert isinstance(historical_response, HazardEventDataResponse)
+    historical_by_rp = dict(
+        zip(historical_response.return_periods, historical_response.intensities)
+    )
+    assert historical_by_rp[20.0] == pytest.approx(0.5)
+    assert historical_by_rp[100.0] == pytest.approx(1.0)
