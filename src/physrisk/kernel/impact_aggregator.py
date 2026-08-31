@@ -1,7 +1,7 @@
 from collections import defaultdict
 from dataclasses import dataclass
 import logging
-from typing import Callable, Generator, NamedTuple, Optional
+from typing import Generator, NamedTuple, Optional
 from typing_extensions import Protocol
 
 import numpy as np
@@ -319,7 +319,9 @@ def _run_simulation(
         f"for {len(inputs.all_acute_impacted_assets)} assets."
     )
 
-    event_insurance_provider = SimpleEventInsuranceProvider(insurance_provider, inputs.all_acute_impacted_assets)
+    event_insurance_provider = SimpleEventInsuranceProvider(insurance_provider,
+                                                            financial_model.financial_data_provider,
+                                                            inputs.all_acute_impacted_assets)
 
     # for a batch of events
     for event_start in range(0, n_events, event_batch_sz):
@@ -328,7 +330,7 @@ def _run_simulation(
 
         # insurance model: for each asset in the batch we draw a uniform variate
         # used to model if the asset is insured for a given hazard given statistical uptake
-        is_insured = event_insurance_provider.next_is_insured_in_batch(event_end - event_start, insurance_generator)
+        claim_payment = event_insurance_provider.next_claim_payments_in_batch(event_end - event_start, insurance_generator)
 
         for (
             hazard_type,
@@ -346,15 +348,22 @@ def _run_simulation(
                     impact_samples = exceed_curve.get_samples(
                         1.0 - inv_severities[sz_idx, :]
                     )
-                    asset = inputs.all_acute_impacted_assets[
-                        non_zero_indices[asset_idx]
-                    ]
+                    idx_in_all_acute_impacted_assets = non_zero_indices[asset_idx]
+                    asset = inputs.all_acute_impacted_assets[idx_in_all_acute_impacted_assets]
                     damage, revenue_loss = (
                         financial_model.frac_damage_to_restoration_cost_and_revenue_loss(
                             asset, impact_samples, "EUR"
                         )
                     )
-                    claim = is_insured(hazard_type, non_zero_indices[asset_idx])
+                    # mitigation of losses through insurance claims:
+                    damage = damage - claim_payment(damage,
+                                                   idx_in_all_acute_impacted_assets,
+                                                   hazard_type,
+                                                   QuantityType.DAMAGE)
+                    revenue = revenue_loss - claim_payment(revenue_loss,
+                                idx_in_all_acute_impacted_assets,
+                                hazard_type,
+                                QuantityType.REVENUE_LOSS)
 
                     for val, qt in [
                         (damage, QuantityType.DAMAGE),
@@ -682,10 +691,16 @@ def aggregate_impacts(
     return {**portfolio_results, **asset_results}
 
 
+class HazardSeverities(NamedTuple):
+    hazard_type: type[Hazard]
+    inv_severities: np.ndarray
+    """Inverse severities with shape (number of severity zones, number of events in batch)."""
+
+
 class EventSeverityProvider(Protocol):
     def next_inv_severities_in_batch(
         self, n_events: int, generator: np.random.Generator
-    ) -> Generator[tuple[type[Hazard], np.ndarray], None, None]:
+    ) -> Generator[HazardSeverities, None, None]:
         """Returns a Generator that gives the inverse severities for each hazard type for this
         batch of events.
 
@@ -694,8 +709,7 @@ class EventSeverityProvider(Protocol):
             generator (np.random.Generator): Random number generator.
 
         Yields:
-            Generator[tuple[type[Hazard], np.ndarray], None, None]: For each hazard type, an array
-            of inverse severities with shape (number of severity zones, number of events in batch).
+            HazardSeverities: The hazard type and its inverse severities for the batch.
         """
         ...
 
@@ -706,30 +720,47 @@ class EventSeverityProvider(Protocol):
         ...
 
 
+class ClaimPayment(Protocol):
+    def __call__(
+        self,
+        loss: np.ndarray,
+        idx_in_all_acute_impacted_assets: int,
+        hazard_type: type[Hazard],
+        impact_type: QuantityType,
+    ) -> np.ndarray:
+        """Insurer's payout (indemnity) for a loss, net of deductible and capped at limit,
+        which are looked up for the asset of the given index. Name of index 
+        emphasizes that this is the index of the asset within the list of all assets
+        potentially impacted by an event (i.e. acute-impacted)."""
+        ...
+
+
 class EventInsuranceProvider(Protocol):
     def next_claim_payments_in_batch(
-         self, n_events: int, generator: np.random.Generator   
-    ) -> Callable[[type[Hazard], int], np.ndarray]:
-        """Returns a function that returns a mask indicating whether an asset is insured for each hazard type
-        in the batch of events.
+         self, n_events: int, generator: np.random.Generator
+    ) -> ClaimPayment:
+        """Returns a function that gives the insurer's claim payment for a loss, for this
+        batch of events.
 
         Args:
             n_events (int): Number of events in the batch.
             generator (np.random.Generator): Random number generator.
 
         Returns:
-            Callable[[type[Hazard]], np.ndarray]: Function providing the mask for each hazard.
+            ClaimPayment: Function providing the claim payment for a given loss.
         """
 
 class SimpleEventInsuranceProvider(EventInsuranceProvider):
-    def __init__(self, insurance: InsuranceDataProvider,
+    def __init__(self, insurance: Optional[InsuranceDataProvider],
                  financials: FinancialDataProvider,
                  all_acute_impacted_assets: list[Asset]):
         self._all_acute_impacted_assets = all_acute_impacted_assets
         self._insurance = insurance
         self._financials = financials
     
-    def next_is_insured_in_batch(self, n_events: int, generator: np.random.Generator):
+    def next_claim_payments_in_batch(self, n_events: int, generator: np.random.Generator):
+        if self._insurance is None:
+            return self._no_claim
         randoms = generator.random(
                 size=(len(self._all_acute_impacted_assets), n_events),
                 dtype=np.float32,
@@ -741,14 +772,16 @@ class SimpleEventInsuranceProvider(EventInsuranceProvider):
             asset = self._all_acute_impacted_assets[idx_in_all_acute_impacted_assets]
             info = self._insurance(asset, hazard_type, impact_type)
             is_insured = randoms[idx_in_all_acute_impacted_assets, :] > (1. - info.uptake)
-            insured_value = (self._financials.total_insurable_value(asset) if impact_type == QuantityType.DAMAGE else
-                self._financials.revenue_attributable_to_asset(asset))
+            insured_value = (self._financials.total_insurable_value(asset, "EUR") if impact_type == QuantityType.DAMAGE else
+                self._financials.revenue_attributable_to_asset(asset, "EUR"))
             deductible = insured_value * info.deductable
             limit = insured_value * info.limit
             claimed_loss = is_insured * loss
             return np.minimum(np.maximum(claimed_loss - deductible, 0) , limit)
         return claim_payment
 
+    def _no_claim(self, loss: np.ndarray, idx_in_all_acute_impacted_assets: int, hazard_type: type[Hazard], impact_type: QuantityType) -> np.ndarray:
+        return 0
 
 class UncorrelatedEventSeverityProvider(EventSeverityProvider):
     def __init__(self, n_non_zero_assets_by_hazard: dict[type[Hazard], int]):
@@ -760,13 +793,13 @@ class UncorrelatedEventSeverityProvider(EventSeverityProvider):
 
     def next_inv_severities_in_batch(
         self, n_events: int, generator: np.random.Generator
-    ) -> Generator[tuple[type[Hazard], np.ndarray], None, None]:
+    ) -> Generator[HazardSeverities, None, None]:
         for hazard_type in self.n_severity_zones_by_hazard.keys():
             randoms = generator.random(
                 size=(self.n_severity_zones_by_hazard[hazard_type], n_events),
                 dtype=np.float32,
             )
-            yield hazard_type, randoms
+            yield HazardSeverities(hazard_type, randoms)
 
     def severity_zone_to_asset_indices(
         self, hazard_type: type[Hazard]

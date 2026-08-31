@@ -32,6 +32,7 @@ from physrisk.kernel.hazards import (
 )
 from physrisk.kernel.impact import AssetImpactResult, ImpactKey
 from physrisk.kernel.impact_aggregator import SimpleEventInsuranceProvider, aggregate_impacts
+from physrisk.kernel.insurance_model import SectoralInsuranceData
 from physrisk.kernel.impact_distrib import ImpactDistrib
 from physrisk.kernel.risk import QuantityType, RiskQuantityKey
 from physrisk.vulnerability_models.vulnerability import VulnerabilityModelsFactory
@@ -631,7 +632,12 @@ def test_impact_aggregation_multi_hazard():
 
 
 def test_simple_event_insurance_provider():
-    """SimpleEventInsuranceProvider returns is_insured masks consistent with uptake by hazard and occupancy code.
+    """SimpleEventInsuranceProvider returns claim payments consistent with uptake by hazard and occupancy code.
+
+    Deductable is set to 0 and limit far above the unit loss used in this test, so that the claim payment for
+    a given (asset, hazard) reduces to an is_insured indicator (loss if insured, 0 if not). This lets us test
+    the underlying uptake/correlation behaviour directly, as the previous version of this test did via a
+    boolean is_insured mask.
 
     3 assets with different occupancy codes and uptake rules:
       asset_0 (occ=1000): flood uptake=0.0 → always insured; fire uptake=1.0 → never insured
@@ -653,15 +659,31 @@ def test_simple_event_insurance_provider():
         (3000, Fire): 0.2,
     }
 
-    def mock_uptake(asset: Asset, hazard_type: type) -> float:
-        return uptake_table[(asset.occupancy_code, hazard_type)]
+    def mock_insurance(asset: Asset, hazard_type: type, impact_type: QuantityType) -> SectoralInsuranceData:
+        uptake = uptake_table[(asset.occupancy_code, hazard_type)]
+        return SectoralInsuranceData(uptake=uptake, deductable=0.0, limit=1.0)
 
-    provider = SimpleEventInsuranceProvider(uptake=mock_uptake, assets=assets)
+    class _ConstantFinancialDataProvider:
+        def revenue_attributable_to_asset(self, asset: Asset, currency: str) -> float:
+            return 1.0e9
+
+        def total_insurable_value(self, asset: Asset, currency: str) -> float:
+            return 1.0e9
+
+    provider = SimpleEventInsuranceProvider(
+        insurance=mock_insurance,
+        financials=_ConstantFinancialDataProvider(),
+        all_acute_impacted_assets=assets,
+    )
     n_events = 10000
     generator = np.random.default_rng(seed=111)
+    loss = np.ones(n_events)
     fire_batch: list[np.ndarray] = []
     for batch in range(2):
-        is_insured = provider.next_is_insured_in_batch(n_events, generator)
+        claim_payment = provider.next_claim_payments_in_batch(n_events, generator)
+
+        def is_insured(hazard_type: type, asset_idx: int) -> np.ndarray:
+            return claim_payment(loss, asset_idx, hazard_type, QuantityType.DAMAGE) > 0
 
         # asset_0, flood: uptake=0.0 → never True
         assert not np.any(is_insured(RiverineInundation, 0))
@@ -678,7 +700,7 @@ def test_simple_event_insurance_provider():
         # asset_2, flood: uptake=0.5 → ~50% True
         np.testing.assert_allclose(np.mean(is_insured(RiverineInundation, 2)), 0.5, atol=0.02)
 
-        # behaviour we want is that probability of fire uptake, given flood uptake is 0.2 / 0.5 
+        # behaviour we want is that probability of fire uptake, given flood uptake is 0.2 / 0.5
         np.testing.assert_allclose(np.mean(is_insured(Fire, 2)), 0.2, atol=0.02)
 
         # the probability of fire insurance given flood insurance is uptake_fire / uptake_inundation = 0.4 in this model, not 0.2
