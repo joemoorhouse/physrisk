@@ -96,23 +96,29 @@ class ByAssetAggregationKeys(AggregationKeys):
         ]
 
 
-class HazardQuantityAggregationKeys(AggregationKeys):
+class PortfolioAggregationKeys(AggregationKeys):
+    """Aggregator that provides a portfolio-wide total per quantity type, ignoring
+    hazard type but split by portfolio via the asset's 'aggregation_id' attribute."""
+
     def get_aggregation_keys(
         self, asset: Asset, hazard_type: type[Hazard], quantity: QuantityType
     ) -> list[RiskQuantityKey]:
+        agg_id = getattr(asset, "aggregation_id", None)
         return [
-            RiskQuantityKey(quantity=quantity, hazard_type=hazard_type),
+            RiskQuantityKey(quantity=quantity, agg_id=agg_id),
         ]
 
 
-class DefaultAggregationKeys(AggregationKeys):
+class HazardQuantityAggregationKeys(AggregationKeys):
+    """Aggregator that provides results by hazard type and quantity type, split by
+    portfolio via the asset's 'aggregation_id' attribute."""
+
     def get_aggregation_keys(
         self, asset: Asset, hazard_type: type[Hazard], quantity: QuantityType
     ) -> list[RiskQuantityKey]:
-        agg_id = getattr(asset, "agg_id", None)
+        agg_id = getattr(asset, "aggregation_id", None)
         return [
-            RiskQuantityKey(quantity=quantity, agg_id=agg_id),
-            RiskQuantityKey(quantity=quantity, agg_id=agg_id, hazard_type=hazard_type),
+            RiskQuantityKey(quantity=quantity, hazard_type=hazard_type, agg_id=agg_id),
         ]
 
 
@@ -294,12 +300,6 @@ def _run_simulation(
     insurance_provider: Optional[InsuranceDataProvider] = None,
 ) -> dict[RiskQuantityKey, np.ndarray]:
     """Run Monte Carlo simulation; return per-event impact arrays keyed by RiskQuantityKey."""
-    quantity_types = [
-        QuantityType.DAMAGE,
-        QuantityType.REVENUE_LOSS,
-        QuantityType.COSTS_INCREASE,
-    ]
-
     severity_provider = UncorrelatedEventSeverityProvider(
         {h: len(v) for h, v in inputs.idx_in_all_acute_impacted_assets.items()}
     )
@@ -310,9 +310,9 @@ def _run_simulation(
     by_hazard_agg = Aggregator(
         key_provider=HazardQuantityAggregationKeys(), size=(n_events,)
     )
-    all_impacts: dict[QuantityType, np.ndarray] = {
-        qt: np.zeros(shape=(n_events)) for qt in quantity_types
-    }
+    portfolio_agg = Aggregator(
+        key_provider=PortfolioAggregationKeys(), size=(n_events,)
+    )
 
     logger.info(
         f"Starting to aggregate impacts for {n_events} events, in batches of {event_batch_sz}, "
@@ -402,20 +402,26 @@ def _run_simulation(
             (QuantityType.COSTS_INCREASE, asset_revenue),
         ]:
             for asset in inputs.all_assets:
-                all_impacts[qt][event_start:event_end] += np.minimum(
+                capped = np.minimum(
                     by_asset_batch_agg.aggregation_pools.get(
                         RiskQuantityKey(quantity=qt, asset=asset), np.array(0.0)
                     ),
                     cap[asset],
                 )
+                portfolio_agg.aggregate(
+                    asset,
+                    None,
+                    qt,
+                    capped,
+                    slice=(slice(event_start, event_end),),
+                )
 
         if (event_end // event_batch_sz) % 20 == 0:
             logger.info(f"Processed {event_end} events out of {n_events}.")
 
-    # return both by hazard and
+    # return combined by-hazard and capped 'total' results (one 'total' per portfolio, i.e. per agg_id)
     all_results = by_hazard_agg.aggregation_pools
-    for qt in quantity_types:
-        all_results[RiskQuantityKey(quantity=qt)] = all_impacts[qt]
+    all_results.update(portfolio_agg.aggregation_pools)
     return all_results
 
 
@@ -564,13 +570,18 @@ def _summarise_results(
     asset_revenue: dict[Asset, float],
 ) -> dict[RiskQuantityKey, Quantity]:
     """Normalise per-event arrays by portfolio totals and build exceedance-curve summaries."""
-    sum_asset_tiv = sum(asset_tiv.values())
-    sum_asset_revenue = sum(asset_revenue.values())
+    sum_tiv_by_agg_id: dict[Optional[str], float] = defaultdict(float)
+    sum_revenue_by_agg_id: dict[Optional[str], float] = defaultdict(float)
+    for asset, tiv in asset_tiv.items():
+        sum_tiv_by_agg_id[getattr(asset, "aggregation_id", None)] += tiv
+    for asset, revenue in asset_revenue.items():
+        sum_revenue_by_agg_id[getattr(asset, "aggregation_id", None)] += revenue
+
     for k, v in all_results.items():
         if k.quantity == QuantityType.DAMAGE:
-            all_results[k] = v / sum_asset_tiv
+            all_results[k] = v / sum_tiv_by_agg_id[k.agg_id]
         elif k.quantity == QuantityType.REVENUE_LOSS:
-            all_results[k] = v / sum_asset_revenue
+            all_results[k] = v / sum_revenue_by_agg_id[k.agg_id]
 
     return_periods = np.array([10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0])
     quantiles = 1.0 - 1.0 / return_periods

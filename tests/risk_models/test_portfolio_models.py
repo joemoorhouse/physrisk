@@ -128,6 +128,80 @@ def test_impact_aggregation():
     np.testing.assert_allclose(mean_damage_mc, mean_damage_exact, rtol=0.02)
 
 
+def test_impact_aggregation_multiple_portfolios():
+    """Assets tagged with different 'aggregation_id' values should produce separate,
+    independently-normalised portfolio-level results (keyed by RiskQuantityKey.agg_id),
+    rather than being pooled into a single portfolio total.
+    """
+    impact_bin_edges = np.array([0.1, 0.2, 0.4, 0.8])
+    impact_probabilities = np.array(
+        [(1.0 - 0.5) / 100, (0.5 - 0.1) / 100.0, 0.1 / 100.0]
+    )
+
+    # portfolio A's assets have 10x the impact severity of portfolio B's
+    portfolio_scale = {"A": 10.0, "B": 1.0}
+    impacts: Dict[ImpactKey, list[AssetImpactResult]] = {}
+    n_assets = 4000
+    for i in range(n_assets):
+        portfolio = "A" if i % 2 == 0 else "B"
+        asset_impact = AssetImpactResult(
+            impact=ImpactDistrib(
+                RiverineInundation,
+                impact_bin_edges.copy(),
+                (impact_probabilities * portfolio_scale[portfolio]).copy(),
+                "",
+            )
+        )
+        impacts[
+            ImpactKey(
+                asset=Asset(
+                    id=f"asset_{i}",
+                    latitude=0.0,
+                    longitude=0.0,
+                    aggregation_id=portfolio,
+                ),
+                hazard_type=RiverineInundation,
+                scenario="historical",
+                key_year=None,
+            )
+        ] = [asset_impact]
+
+    financial_model = DefaultFinancialModel(
+        data_provider=TestFinancialDataProvider(), downtime_config=[]
+    )
+
+    results = aggregate_impacts(impacts, financial_model, "historical", None)
+
+    # no pooled 'all portfolios' total should be produced when every asset has an aggregation_id
+    assert (
+        RiskQuantityKey(QuantityType.DAMAGE, None, None, RiverineInundation)
+        not in results
+    )
+
+    for portfolio in portfolio_scale:
+        damage = results[
+            RiskQuantityKey(QuantityType.DAMAGE, None, portfolio, RiverineInundation)
+        ]
+        # all assets have equal TIV, so mean damage should equal the plain average of
+        # mean_impact() over just that portfolio's assets, not the whole population
+        mean_damage_exact = np.mean(
+            [
+                i[0].impact.mean_impact()
+                for k, i in impacts.items()
+                if k.asset.aggregation_id == portfolio
+            ]
+        )
+        np.testing.assert_allclose(damage.mean, mean_damage_exact, rtol=0.03)
+
+    damage_a = results[
+        RiskQuantityKey(QuantityType.DAMAGE, None, "A", RiverineInundation)
+    ]
+    damage_b = results[
+        RiskQuantityKey(QuantityType.DAMAGE, None, "B", RiverineInundation)
+    ]
+    np.testing.assert_allclose(damage_a.mean / damage_b.mean, 10.0, rtol=0.05)
+
+
 def test_impact_aggregation_end_to_end():
     """Mocked test that aggregates riverine inundation over assets and calculates
     portfolio level scores.

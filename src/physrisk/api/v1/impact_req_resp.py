@@ -31,7 +31,7 @@ class CalcSettings(BaseModel):
     )
     vulnerability_curve_mapping: Literal["hazus", "hazus_no_unknown", "config_only"] = (
         Field(
-            "hazus_no_unknown",
+            "hazus",
             description="Configuration for the vulnerability models."
             "hazus: use hazus curves, for the unknown occupancy code, use an average of hazus curves."
             "hazus_no_unknown: use hazus curves, for the unknown occupancy code, fallback to config based curves."
