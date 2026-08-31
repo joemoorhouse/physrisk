@@ -124,7 +124,7 @@ class _SimulationInputs:
     impacts_exceed_curves_sorted: dict[
         type[Hazard], list[tuple[ImpactDistrib, ExceedanceCurve]]
     ]
-    acute_impacted_asset_indices: dict[type[Hazard], list[int]]
+    idx_in_all_acute_impacted_assets: dict[type[Hazard], list[int]] # for each hazard the indices of the affected assets as look-up into all_acute_impacted_assets
     chronic_impacts_sorted: dict[type[Hazard], np.ndarray]
     chronic_hazards_in_scope: set[type[Hazard]]
 
@@ -197,7 +197,7 @@ def _build_acute_structures(
     impacts_exceed_curves_sorted: dict[
         type[Hazard], list[tuple[ImpactDistrib, ExceedanceCurve]]
     ] = defaultdict(list)
-    acute_impacted_asset_indices: dict[type[Hazard], list[int]] = defaultdict(list)
+    idx_in_all_acute_impacted_assets: dict[type[Hazard], list[int]] = defaultdict(list)
 
     for hazard_type, assets in acute_impacted_assets.items():
         impacts_exceed_curves_for_hazard = {
@@ -213,12 +213,12 @@ def _build_acute_structures(
             impacts_exceed_curves_for_hazard[asset]
             for asset in sorted_assets_for_hazard
         ]
-        acute_impacted_asset_indices[hazard_type] = indices
+        idx_in_all_acute_impacted_assets[hazard_type] = indices
 
     return (
         all_acute_impacted_assets,
         impacts_exceed_curves_sorted,
-        acute_impacted_asset_indices,
+        idx_in_all_acute_impacted_assets,
     )
 
 
@@ -301,7 +301,7 @@ def _run_simulation(
     ]
 
     severity_provider = UncorrelatedEventSeverityProvider(
-        {h: len(v) for h, v in inputs.acute_impacted_asset_indices.items()}
+        {h: len(v) for h, v in inputs.idx_in_all_acute_impacted_assets.items()}
     )
     generator = np.random.default_rng(seed=111)
     insurance_generator = np.random.default_rng(seed=111)
@@ -338,7 +338,7 @@ def _run_simulation(
         ):
             # get the severities for each zone for the batch of events of the given hazard type
             impacts_ec = inputs.impacts_exceed_curves_sorted[hazard_type]
-            non_zero_indices = inputs.acute_impacted_asset_indices[hazard_type]
+            non_zero_indices = inputs.idx_in_all_acute_impacted_assets[hazard_type]
             sz_to_assets = severity_provider.severity_zone_to_asset_indices(hazard_type)
             for sz_idx in range(inv_severities.shape[0]):
                 for asset_idx in sz_to_assets[sz_idx]:
@@ -438,7 +438,7 @@ def _asset_level_drilldown(
 
     # --- Acute hazards -----------------------------------------------------------
     for hazard_type, impacts_ec in inputs.impacts_exceed_curves_sorted.items():
-        non_zero_indices = inputs.acute_impacted_asset_indices[hazard_type]
+        non_zero_indices = inputs.idx_in_all_acute_impacted_assets[hazard_type]
         for asset_idx, (distrib, ec) in enumerate(impacts_ec):
             asset = inputs.all_acute_impacted_assets[non_zero_indices[asset_idx]]
 
@@ -626,12 +626,12 @@ def aggregate_impacts(
     ) = _classify_impacts(impacts, scenario, key_year)
     all_assets_list = sorted(all_assets, key=lambda a: a.id if a.id is not None else "")
     # all_acute_impacted_assets: sorted list of all assets with any acute impact (i.e. from any hazard type)
-    # acute_impacted_asset_indices: index of asset in all_acute_impacted_assets, for assets impacted by the given hazard type
     # impacts_exceed_curves_sorted: the corresponding ImpactDistribs and ExceedanceCurves
+    # idx_in_all_acute_impacted_assets: index of asset in all_acute_impacted_assets, for assets impacted by the given hazard type
     (
         all_acute_impacted_assets,
         impacts_exceed_curves_sorted,
-        acute_impacted_asset_indices,
+        idx_in_all_acute_impacted_assets,
     ) = _build_acute_structures(acute_impacted_assets, impacts_exceed_curves)
     # chronic impacts per hazard for all assets
     chronic_impacts_sorted = _build_chronic_arrays(
@@ -650,7 +650,7 @@ def aggregate_impacts(
         all_acute_impacted_assets=all_acute_impacted_assets,
         impacts_exceed_curves_sorted=impacts_exceed_curves_sorted,  # impacts and exceedance curves for assets with acute impact
         # for hazard
-        acute_impacted_asset_indices=acute_impacted_asset_indices,  # index
+        idx_in_all_acute_impacted_assets=idx_in_all_acute_impacted_assets,  # indices of assets with acute impact for hazard
         chronic_impacts_sorted=chronic_impacts_sorted,
         chronic_hazards_in_scope=chronic_hazards_in_scope,
     )
@@ -686,7 +686,7 @@ class EventSeverityProvider(Protocol):
     def next_inv_severities_in_batch(
         self, n_events: int, generator: np.random.Generator
     ) -> Generator[tuple[type[Hazard], np.ndarray], None, None]:
-        """Returns a generator that gives the inverse severities for each hazard type for this
+        """Returns a Generator that gives the inverse severities for each hazard type for this
         batch of events.
 
         Args:
@@ -694,7 +694,8 @@ class EventSeverityProvider(Protocol):
             generator (np.random.Generator): Random number generator.
 
         Yields:
-            Generator[tuple[type[Hazard], np.ndarray], None, None]: The severities for each hazard type.
+            Generator[tuple[type[Hazard], np.ndarray], None, None]: For each hazard type, an array
+            of inverse severities with shape (number of severity zones, number of events in batch).
         """
         ...
 
@@ -706,7 +707,7 @@ class EventSeverityProvider(Protocol):
 
 
 class EventInsuranceProvider(Protocol):
-    def next_is_insured_in_batch(
+    def next_claim_payments_in_batch(
          self, n_events: int, generator: np.random.Generator   
     ) -> Callable[[type[Hazard], int], np.ndarray]:
         """Returns a function that returns a mask indicating whether an asset is insured for each hazard type
@@ -721,25 +722,32 @@ class EventInsuranceProvider(Protocol):
         """
 
 class SimpleEventInsuranceProvider(EventInsuranceProvider):
-    def __init__(self, insurance: InsuranceDataProvider, financials: FinancialDataProvider, assets: list[Asset]):
-        self._assets = assets
+    def __init__(self, insurance: InsuranceDataProvider,
+                 financials: FinancialDataProvider,
+                 all_acute_impacted_assets: list[Asset]):
+        self._all_acute_impacted_assets = all_acute_impacted_assets
         self._insurance = insurance
         self._financials = financials
-        self._asset_idx = {i: a for i, a in enumerate(assets)}
     
     def next_is_insured_in_batch(self, n_events: int, generator: np.random.Generator):
         randoms = generator.random(
-                size=(len(self._assets), n_events),
+                size=(len(self._all_acute_impacted_assets), n_events),
                 dtype=np.float32,
         )
-        def claim_amount(hazard_type: type[Hazard], asset: Asset, impact_type: str, loss: np.ndarray) -> np.ndarray:
-            asset_idx = self._asset_idx[asset]
+        def claim_payment(loss: np.ndarray, idx_in_all_acute_impacted_assets: int, hazard_type: type[Hazard], impact_type: QuantityType) -> np.ndarray:
+            """Insurer's payout net of deductible and capped at limit;
+            indemnity or claim payment/net claim
+            """
+            asset = self._all_acute_impacted_assets[idx_in_all_acute_impacted_assets]
             info = self._insurance(asset, hazard_type, impact_type)
-            is_insured = randoms[asset_idx, :] > (1. - info.uptake)
-            deductable = self._financials.total_insurable_value(asset) * info.deductable
-
-            # samples[is_insured] -= np.minimum(np.maximum(samples[is_insured] - deduct, 0) , limit))
-        return claim_amount
+            is_insured = randoms[idx_in_all_acute_impacted_assets, :] > (1. - info.uptake)
+            insured_value = (self._financials.total_insurable_value(asset) if impact_type == QuantityType.DAMAGE else
+                self._financials.revenue_attributable_to_asset(asset))
+            deductible = insured_value * info.deductable
+            limit = insured_value * info.limit
+            claimed_loss = is_insured * loss
+            return np.minimum(np.maximum(claimed_loss - deductible, 0) , limit)
+        return claim_payment
 
 
 class UncorrelatedEventSeverityProvider(EventSeverityProvider):

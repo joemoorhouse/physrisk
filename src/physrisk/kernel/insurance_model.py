@@ -8,6 +8,7 @@ from typing_extensions import Protocol
 from physrisk.kernel.assets import Asset
 from physrisk.kernel.financial_model import FinancialDataProvider
 from physrisk.kernel.hazards import Hazard
+from physrisk.kernel.risk import QuantityType
 
 
 class SectoralInsuranceData(NamedTuple):
@@ -17,13 +18,13 @@ class SectoralInsuranceData(NamedTuple):
 
 
 class InsuranceDataProvider(Protocol):
-    def __call__(self, asset: Asset, hazard_type: type[Hazard], impact_type: str) -> SectoralInsuranceData:
+    def __call__(self, asset: Asset, hazard_type: type[Hazard], impact_type: QuantityType) -> SectoralInsuranceData:
         """Provide insurance data, including state support.
 
         Args:
             asset (Asset): Asset
             hazard_type (type[Hazard]): Hazard type
-            impact_type (str): `damage` or `disruption`
+            impact_type (QuantityType): `QuantityType.DAMAGE` or `QuantityType.REVENUE_LOSS`
         """
         ...
 
