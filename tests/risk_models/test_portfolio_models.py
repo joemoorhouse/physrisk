@@ -20,6 +20,7 @@ from physrisk.kernel.financial_model import (
     DefaultFinancialModel,
     FinancialDataProvider,
 )
+from physrisk.kernel.calculation import DefaultMeasuresFactory
 from physrisk.kernel.hazard_model import HazardModelFactory
 from physrisk.kernel.hazards import (
     ChronicHeat,
@@ -38,6 +39,7 @@ from physrisk.kernel.impact_aggregator import (
 from physrisk.kernel.insurance_model import SectoralInsuranceData
 from physrisk.kernel.impact_distrib import ImpactDistrib
 from physrisk.kernel.risk import QuantityType, RiskQuantityKey
+from physrisk.risk_models.portfolio_risk_model import CompanyRiskMeasureCalculator
 from physrisk.vulnerability_models.vulnerability import VulnerabilityModelsFactory
 from tests.data.test_hazard_model_store import ZarrStoreMocker
 from tests.vulnerability_models.test_config_based_vulnerability import create_store
@@ -544,10 +546,23 @@ def test_impact_aggregation_end_to_end_multi_hazard():
 
     Uses AssetFinancialDrilldown to get analytical per-asset AALs alongside the Monte Carlo
     portfolio means produced by CompanyRiskMeasureCalculator.  The two code paths are
-    independent; convergence (5 % rtol) verifies both.
+    independent; convergence (5% rtol) verifies both.
 
     Asset layout: assets 0-1 carry flood risk; all 6 share wind, fire and chronic-heat exposure.
     FinancialDataStore default (no financial data supplied): TIV = revenue = 100 per asset.
+
+    Also exercises two extra end-to-end features, both threaded through the same request:
+
+    - Multiple aggregation IDs: assets 0-2 are left in the (unlabelled) pooled portfolio,
+      assets 3-5 are tagged with aggregation_id='group_b'. Both sub-portfolios should get
+      their own, independently-normalised entries in `portfolio_impacts` (distinguished by
+      the new `ImpactKey.aggregation_id` field), and each should reconcile against the
+      analytical AAL averaged over just its own assets.
+    - Insurance: Wind damage is fully insured (uptake=1, no deductible, limit=TIV) via a
+      `CompanyRiskMeasureCalculator` injected with an insurance provider (through a
+      `measures_factory` container override). The analytical drilldown does not model
+      insurance, so Wind damage is the one hazard/impact-type pair expected to diverge
+      between the (insured) MC portfolio mean and the (uninsured) analytical AAL.
     """
     scenarios = ["ssp585", "historical"]
     years = [2050]
@@ -729,6 +744,21 @@ def test_impact_aggregation_end_to_end_multi_hazard():
         ):
             return hazard_model
 
+    # Wind damage is fully insured for every asset: uptake=1, no deductible, limit
+    # covers the whole TIV, so insurer claims exactly offset the loss.
+    def insurance(
+        asset: Asset, hazard_type: type, impact_type: QuantityType
+    ) -> SectoralInsuranceData:
+        if hazard_type is Wind and impact_type == QuantityType.DAMAGE:
+            return SectoralInsuranceData(uptake=1.0, deductable=0.0, limit=1.0)
+        return SectoralInsuranceData(uptake=0.0, deductable=0.0, limit=0.0)
+
+    class TestMeasuresFactory(DefaultMeasuresFactory):
+        def portfolio_calculator(self, use_case_id: str):
+            if use_case_id.upper() == "COMPANY":
+                return CompanyRiskMeasureCalculator(insurance_provider=insurance)
+            return super().portfolio_calculator(use_case_id)
+
     container = Container()
     container.override_providers(
         hazard_model_factory=providers.Factory(TestHazardModelFactory)
@@ -746,8 +776,13 @@ def test_impact_aggregation_end_to_end_multi_hazard():
             config=VulnerabilityModelsFactory.embedded_vulnerability_config(),
         )
     )
+    container.override_providers(
+        measures_factory=providers.Factory(TestMeasuresFactory)
+    )
     requester = container.requester()
 
+    # assets 0-2 stay in the pooled (unlabelled) portfolio; assets 3-5 form a second,
+    # independently-aggregated sub-portfolio via 'aggregation_id'.
     assets = Assets(
         items=[
             APIAsset(
@@ -755,6 +790,7 @@ def test_impact_aggregation_end_to_end_multi_hazard():
                 occupancy_code=2000,
                 latitude=latitudes[i],
                 longitude=longitudes[i],
+                aggregation_id="group_b" if i >= 3 else None,
             )
             for i in range(6)
         ]
@@ -799,7 +835,8 @@ def test_impact_aggregation_end_to_end_multi_hazard():
 
     # Collect analytical per-asset AALs from the drilldown (ssp585 / 2050 only)
     # FinancialDataStore default: TIV = revenue = 100 per asset (no financial data supplied)
-    n_assets = 6
+    # asset_ids 0-2 are in the pooled ('') portfolio, 3-5 are in 'group_b'.
+    group_of_asset = {f"asset_{i}": ("group_b" if i >= 3 else "") for i in range(6)}
 
     aal_by_key: dict[tuple[str, str], list[float]] = {
         (m.key.hazard_type, m.key.measure_id.split("_", 1)[1]): m.measures
@@ -810,32 +847,59 @@ def test_impact_aggregation_end_to_end_multi_hazard():
         and m.key.year == "2050"
     }
 
-    # Collect MC portfolio means from portfolio_impacts (ssp585 / 2050 only)
-    mc_by_key: dict[tuple[str, str], float] = {
-        (pi.key.hazard_type, pi.impact_type): pi.impact_mean
+    def analytical_mean(hazard: str, impact_type: str, agg_id: str) -> float:
+        vals = [
+            v
+            for asset_id, v in zip(
+                res.risk_measures.asset_ids, aal_by_key[(hazard, impact_type)]
+            )
+            if group_of_asset[asset_id] == agg_id
+        ]
+        return sum(vals) / len(vals)
+
+    # Collect MC portfolio means from portfolio_impacts (ssp585 / 2050 only), split by
+    # aggregation_id so the two sub-portfolios ('' and 'group_b') are distinguishable.
+    mc_by_key: dict[tuple[str, str, str], float] = {
+        (pi.key.hazard_type, pi.impact_type, pi.key.aggregation_id): pi.impact_mean
         for pi in res.portfolio_impacts
         if pi.key.scenario_id == "ssp585" and pi.key.year == "2050"
     }
 
-    # For each hazard / impact-type pair:
-    #   mean(per-asset fractional AAL)  ==  MC portfolio mean   (within MC noise)
-    # Drilldown values are already fractions (divided by per-asset TIV or revenue), so the
-    # portfolio mean is simply the average across assets (exact when all TIVs/revenues are equal).
+    # For each hazard / impact-type pair and each sub-portfolio:
+    #   mean(per-asset fractional AAL, restricted to that sub-portfolio's assets)
+    #   == MC portfolio mean for that sub-portfolio (within MC noise).
+    # Wind damage is fully insured (see `insurance` above), which the analytical drilldown
+    # does not model, so it is checked separately below instead of via this reconciliation.
     for hazard, impact_type in [
         ("RiverineInundation", "damage"),
-        ("Wind", "damage"),
         ("Fire", "damage"),
         ("ChronicHeat", "disruption/revenue"),
     ]:
-        k = (hazard, impact_type)
-        assert k in aal_by_key, f"Analytical AAL missing for {k}"
+        for agg_id in ("", "group_b"):
+            k = (hazard, impact_type, agg_id)
+            if hazard == "RiverineInundation" and agg_id == "group_b":
+                # flood only affects assets 0-1, both in the pooled portfolio
+                assert k not in mc_by_key, f"unexpected flood result for {k}"
+                continue
+            assert k in mc_by_key, f"MC portfolio mean missing for {k}"
+            analytical = analytical_mean(hazard, impact_type, agg_id)
+            # sub-portfolios only have 2-3 assets each (vs. 6 for the full pool), so MC
+            # noise is proportionally larger than in the single-portfolio comparison.
+            np.testing.assert_allclose(
+                mc_by_key[k],
+                analytical,
+                rtol=0.15,
+                err_msg=f"MC vs analytical mismatch for {k}: "
+                f"mc={mc_by_key[k]:.6g}, analytical={analytical:.6g}",
+            )
+
+    # Wind damage: fully insured, so the MC portfolio mean (net of claims) should be ~0 in
+    # both sub-portfolios, while the (uninsured) analytical AAL remains clearly positive.
+    for agg_id in ("", "group_b"):
+        k = ("Wind", "damage", agg_id)
         assert k in mc_by_key, f"MC portfolio mean missing for {k}"
-        analytical = sum(aal_by_key[k]) / n_assets
-        np.testing.assert_allclose(
-            mc_by_key[k],
-            analytical,
-            rtol=0.05,
-            err_msg=f"MC vs analytical mismatch for {k}: mc={mc_by_key[k]:.6g}, analytical={analytical:.6g}",
+        np.testing.assert_allclose(mc_by_key[k], 0.0, atol=1e-6)
+        analytical = analytical_mean("Wind", "damage", agg_id)
+        assert analytical > 1e-5, (
+            f"expected positive uninsured analytical Wind AAL for group {agg_id!r}, got {analytical:.6g}"
         )
-
-

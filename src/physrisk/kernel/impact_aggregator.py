@@ -103,7 +103,7 @@ class PortfolioAggregationKeys(AggregationKeys):
     def get_aggregation_keys(
         self, asset: Asset, hazard_type: Optional[type[Hazard]], quantity: QuantityType
     ) -> list[RiskQuantityKey]:
-        agg_id = getattr(asset, "aggregation_id", None)
+        agg_id = asset.aggregation_id
         return [
             RiskQuantityKey(quantity=quantity, agg_id=agg_id),
         ]
@@ -116,7 +116,7 @@ class HazardQuantityAggregationKeys(AggregationKeys):
     def get_aggregation_keys(
         self, asset: Asset, hazard_type: Optional[type[Hazard]], quantity: QuantityType
     ) -> list[RiskQuantityKey]:
-        agg_id = getattr(asset, "aggregation_id", None)
+        agg_id = asset.aggregation_id
         return [
             RiskQuantityKey(quantity=quantity, hazard_type=hazard_type, agg_id=agg_id),
         ]
@@ -585,9 +585,9 @@ def _summarise_results(
     sum_tiv_by_agg_id: dict[Optional[str], float] = defaultdict(float)
     sum_revenue_by_agg_id: dict[Optional[str], float] = defaultdict(float)
     for asset, tiv in asset_tiv.items():
-        sum_tiv_by_agg_id[getattr(asset, "aggregation_id", None)] += tiv
+        sum_tiv_by_agg_id[asset.aggregation_id] += tiv
     for asset, revenue in asset_revenue.items():
-        sum_revenue_by_agg_id[getattr(asset, "aggregation_id", None)] += revenue
+        sum_revenue_by_agg_id[asset.aggregation_id] += revenue
 
     for k, v in all_results.items():
         if k.quantity == QuantityType.DAMAGE:
