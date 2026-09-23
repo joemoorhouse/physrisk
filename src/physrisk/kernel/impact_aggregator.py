@@ -332,7 +332,7 @@ def _run_simulation(
         by_asset_batch_agg.zero()
         event_end = min(event_start + event_batch_sz, n_events)
 
-        # insurance model: for each asset in the batch we draw a uniform variate
+        # insurance model: for each asset in the batch we draw variates
         # used to model if the asset is insured for a given hazard given statistical uptake
         claim_payment = event_insurance_provider.next_claim_payments_in_batch(
             event_end - event_start, insurance_generator
