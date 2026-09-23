@@ -618,6 +618,7 @@ def aggregate_impacts(
     key_year: Optional[int],
     n_events: int = 50000,
     event_batch_sz: int = 1000,
+    insurance_provider: Optional[InsuranceDataProvider] = None,
 ) -> dict[RiskQuantityKey, Quantity]:
     """Aggregate impacts over assets and hazards for a given scenario and year.
     For acute hazards, i.e. hazards associated with an event, a Monte Carlo approach is used whereby a large number of
@@ -705,6 +706,7 @@ def aggregate_impacts(
         asset_revenue,
         n_events=n_events,
         event_batch_sz=event_batch_sz,
+        insurance_provider=insurance_provider,
     )
     portfolio_results = _summarise_results(all_results, asset_tiv, asset_revenue)
     asset_results = _asset_level_drilldown(

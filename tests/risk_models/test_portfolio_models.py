@@ -205,6 +205,276 @@ def test_impact_aggregation_multiple_portfolios():
     np.testing.assert_allclose(damage_a.mean / damage_b.mean, 10.0, rtol=0.05)
 
 
+def test_impact_aggregation_multi_hazard():
+    """Aggregate Wind, RiverineInundation, Fire (all acute) and ChronicHeat (chronic)
+    over a portfolio of manufacturing assets.
+
+    Asset layout (6 assets total):
+        asset_0, asset_1 : Wind + RiverineInundation (acute), ChronicHeat (chronic)
+        asset_2          : Fire (acute), ChronicHeat (chronic)
+        asset_3, asset_4 : Fire (acute) only
+        asset_5          : zero acute risk, zero chronic risk
+
+    Single-bin impact distributions make theoretical means easy to verify:
+        Wind   [0.0, 0.5], p=0.02  →  mean = 0.25 × 0.02 = 0.005
+        Flood  [0.0, 0.4], p=0.05  →  mean = 0.20 × 0.05 = 0.010
+        Fire   [0.0, 0.8], p=0.01  →  mean = 0.40 × 0.01 = 0.004
+        Heat future  [0, 0.20], p=0.5  →  mean = 0.05
+        Heat histo   [0, 0.10], p=0.4  →  mean = 0.02  →  delta = 0.03
+
+    Financial params (TestFinancialDataProvider): TIV = 100, Revenue = 200 per asset.
+    No downtime model, so acute revenue loss = 0 (only chronic contributes REVENUE_LOSS).
+    """
+    scenario, key_year = "ssp585", 2050
+
+    wind_edges = np.array([0.0, 0.5])
+    wind_probs = np.array([0.02])  # mean 0.005
+    flood_edges = np.array([0.0, 0.4])
+    flood_probs = np.array([0.05])  # mean 0.010
+    fire_edges = np.array([0.0, 0.8])
+    fire_probs = np.array([0.01])  # mean 0.004
+    heat_fut_edges = np.array([0.0, 0.20])
+    heat_fut_probs = np.array([0.5])  # mean 0.05
+    heat_his_edges = np.array([0.0, 0.10])
+    heat_his_probs = np.array([0.4])  # mean 0.02
+    zero_edges = np.array([0.0, 0.0])
+    zero_probs = np.array([0.0])
+
+    a = [
+        ManufacturingAsset(id=f"asset_{i}", latitude=0.0, longitude=0.0)
+        for i in range(6)
+    ]
+
+    def air(hazard_type, edges, probs):
+        return AssetImpactResult(
+            impact=ImpactDistrib(hazard_type, edges.copy(), probs.copy(), "")
+        )
+
+    def ik(asset, hazard_type, sc=scenario, yr=key_year):
+        return ImpactKey(asset=asset, hazard_type=hazard_type, scenario=sc, key_year=yr)
+
+    impacts: Dict[ImpactKey, list[AssetImpactResult]] = {
+        # Wind – assets 0, 1
+        ik(a[0], Wind): [air(Wind, wind_edges, wind_probs)],
+        ik(a[1], Wind): [air(Wind, wind_edges, wind_probs)],
+        # Flood – assets 0, 1
+        ik(a[0], RiverineInundation): [
+            air(RiverineInundation, flood_edges, flood_probs)
+        ],
+        ik(a[1], RiverineInundation): [
+            air(RiverineInundation, flood_edges, flood_probs)
+        ],
+        # Fire – assets 2, 3, 4
+        ik(a[2], Fire): [air(Fire, fire_edges, fire_probs)],
+        ik(a[3], Fire): [air(Fire, fire_edges, fire_probs)],
+        ik(a[4], Fire): [air(Fire, fire_edges, fire_probs)],
+        # ChronicHeat future – assets 0, 1, 2
+        ik(a[0], ChronicHeat): [air(ChronicHeat, heat_fut_edges, heat_fut_probs)],
+        ik(a[1], ChronicHeat): [air(ChronicHeat, heat_fut_edges, heat_fut_probs)],
+        ik(a[2], ChronicHeat): [air(ChronicHeat, heat_fut_edges, heat_fut_probs)],
+        # ChronicHeat historical baseline – assets 0, 1, 2
+        ik(a[0], ChronicHeat, sc="historical", yr=None): [
+            air(ChronicHeat, heat_his_edges, heat_his_probs)
+        ],
+        ik(a[1], ChronicHeat, sc="historical", yr=None): [
+            air(ChronicHeat, heat_his_edges, heat_his_probs)
+        ],
+        ik(a[2], ChronicHeat, sc="historical", yr=None): [
+            air(ChronicHeat, heat_his_edges, heat_his_probs)
+        ],
+        # asset_5 – zero risk; present so its TIV/revenue enter the portfolio denominator
+        ik(a[5], Wind): [air(Wind, zero_edges, zero_probs)],
+    }
+
+    financial_model = DefaultFinancialModel(
+        data_provider=TestFinancialDataProvider(), downtime_config=[]
+    )
+    results = aggregate_impacts(impacts, financial_model, scenario, key_year)
+
+    # Expected means (theoretical):
+    #   sum_tiv     = 6 × 100 = 600
+    #   sum_revenue = 6 × 200 = 1200
+    #
+    #   Acute damage (normalised by sum_tiv):
+    #     Wind  : 2 assets × 100 × 0.005 / 600 = 1/600
+    #     Flood : 2 assets × 100 × 0.010 / 600 = 2/600
+    #     Fire  : 3 assets × 100 × 0.004 / 600 = 1.2/600
+    #
+    #   Chronic revenue loss (normalised by sum_revenue, deterministic):
+    #     ChronicHeat: 3 assets × delta(0.03) / 1200 = 0.09/1200 = 7.5e-5
+
+    expected_wind_damage = 2 * 100 * 0.005 / 600  # 1/600
+    expected_flood_damage = 2 * 100 * 0.010 / 600  # 2/600
+    expected_fire_damage = 3 * 100 * 0.004 / 600  # 1.2/600
+    expected_heat_rev_loss = 3 * 200 * 0.03 / 1200  # 0.015
+
+    rtol = 0.05  # 5% tolerance
+
+    np.testing.assert_allclose(
+        results[RiskQuantityKey(QuantityType.DAMAGE, None, None, Wind)].mean,
+        expected_wind_damage,
+        rtol=rtol,
+    )
+    np.testing.assert_allclose(
+        results[
+            RiskQuantityKey(QuantityType.DAMAGE, None, None, RiverineInundation)
+        ].mean,
+        expected_flood_damage,
+        rtol=rtol,
+    )
+    np.testing.assert_allclose(
+        results[RiskQuantityKey(QuantityType.DAMAGE, None, None, Fire)].mean,
+        expected_fire_damage,
+        rtol=rtol,
+    )
+    # Chronic is deterministic – no Monte Carlo noise
+    np.testing.assert_allclose(
+        results[
+            RiskQuantityKey(QuantityType.REVENUE_LOSS, None, None, ChronicHeat)
+        ].mean,
+        expected_heat_rev_loss,
+    )
+    # asset_5 carries zero impact, so no Wind key exists for it; only the portfolio-level Wind key
+    assert RiskQuantityKey(QuantityType.DAMAGE, None, None, Wind) in results
+    # No Fire result key for assets that only have Wind/Flood
+    assert RiskQuantityKey(QuantityType.DAMAGE, None, None, Fire) in results
+    # Zero-risk asset does not create a spurious per-hazard entry for ChronicHeat
+    assert (
+        RiskQuantityKey(QuantityType.REVENUE_LOSS, None, None, ChronicHeat) in results
+    )
+
+    # Re-run with insurance: Wind damage is fully insured (uptake=1, no deductible,
+    # limit covers the whole TIV), so insurer claims exactly offset the loss and the
+    # net Wind damage should be zeroed out. Flood and Fire are left uninsured
+    # (uptake=0) and should be unaffected, as should the chronic ChronicHeat
+    # revenue loss (insurance only applies to the acute Monte Carlo simulation).
+    def insurance(
+        asset: Asset, hazard_type: type, impact_type: QuantityType
+    ) -> SectoralInsuranceData:
+        if hazard_type is Wind and impact_type == QuantityType.DAMAGE:
+            return SectoralInsuranceData(uptake=1.0, deductable=0.0, limit=1.0)
+        return SectoralInsuranceData(uptake=0.0, deductable=0.0, limit=0.0)
+
+    insured_results = aggregate_impacts(
+        impacts, financial_model, scenario, key_year, insurance_provider=insurance
+    )
+
+    np.testing.assert_allclose(
+        insured_results[RiskQuantityKey(QuantityType.DAMAGE, None, None, Wind)].mean,
+        0.0,
+        atol=1e-9,
+    )
+    np.testing.assert_allclose(
+        insured_results[
+            RiskQuantityKey(QuantityType.DAMAGE, None, None, RiverineInundation)
+        ].mean,
+        expected_flood_damage,
+        rtol=rtol,
+    )
+    np.testing.assert_allclose(
+        insured_results[RiskQuantityKey(QuantityType.DAMAGE, None, None, Fire)].mean,
+        expected_fire_damage,
+        rtol=rtol,
+    )
+    np.testing.assert_allclose(
+        insured_results[
+            RiskQuantityKey(QuantityType.REVENUE_LOSS, None, None, ChronicHeat)
+        ].mean,
+        expected_heat_rev_loss,
+    )
+
+
+def test_simple_event_insurance_provider():
+    """SimpleEventInsuranceProvider returns claim payments consistent with uptake by hazard and occupancy code.
+
+    Deductable is set to 0 and limit far above the unit loss used in this test, so that the claim payment for
+    a given (asset, hazard) reduces to an is_insured indicator (loss if insured, 0 if not). This lets us test
+    the underlying uptake/correlation behaviour directly, as the previous version of this test did via a
+    boolean is_insured mask.
+
+    3 assets with different occupancy codes and uptake rules:
+      asset_0 (occ=1000): flood uptake=0.0 → always insured; fire uptake=1.0 → never insured
+      asset_1 (occ=2000): flood uptake=1.0 → never insured; fire uptake=0.0 → always insured
+      asset_2 (occ=3000): flood uptake=0.5, fire uptake=0.5 → ~50% insured for each
+    """
+    assets = [
+        OEDAsset(id="asset_0", occupancy_code=1000, latitude=0.0, longitude=0.0),
+        OEDAsset(id="asset_1", occupancy_code=2000, latitude=0.0, longitude=0.0),
+        OEDAsset(id="asset_2", occupancy_code=3000, latitude=0.0, longitude=0.0),
+    ]
+
+    uptake_table = {
+        (1000, RiverineInundation): 0.0,
+        (1000, Fire): 1.0,
+        (2000, RiverineInundation): 1.0,
+        (2000, Fire): 0.0,
+        (3000, RiverineInundation): 0.5,
+        (3000, Fire): 0.2,
+    }
+
+    def mock_insurance(
+        asset: Asset, hazard_type: type, impact_type: QuantityType
+    ) -> SectoralInsuranceData:
+        uptake = uptake_table[(cast(OEDAsset, asset).occupancy_code, hazard_type)]
+        return SectoralInsuranceData(uptake=uptake, deductable=0.0, limit=1.0)
+
+    class _ConstantFinancialDataProvider:
+        def revenue_attributable_to_asset(self, asset: Asset, currency: str) -> float:
+            return 1.0e9
+
+        def total_insurable_value(self, asset: Asset, currency: str) -> float:
+            return 1.0e9
+
+    provider = SimpleEventInsuranceProvider(
+        insurance=mock_insurance,
+        financials=_ConstantFinancialDataProvider(),
+        all_acute_impacted_assets=assets,
+    )
+    n_events = 10000
+    generator = np.random.default_rng(seed=111)
+    loss = np.ones(n_events)
+    fire_batch: list[np.ndarray] = []
+    for _batch in range(2):
+        claim_payment = provider.next_claim_payments_in_batch(n_events, generator)
+
+        def is_insured(
+            hazard_type: type, asset_idx: int, claim_payment=claim_payment
+        ) -> np.ndarray:
+            return claim_payment(loss, asset_idx, hazard_type, QuantityType.DAMAGE) > 0
+
+        # asset_0, flood: uptake=0.0 → never True
+        assert not np.any(is_insured(RiverineInundation, 0))
+
+        # asset_0, fire: uptake=1.0 → always True
+        assert np.all(is_insured(Fire, 0))
+
+        # asset_1, flood: uptake=1.0 → always True
+        assert np.all(is_insured(RiverineInundation, 1))
+
+        # asset_1, fire: uptake=0.0 → never True
+        assert not np.any(is_insured(Fire, 1))
+
+        # asset_2, flood: uptake=0.5 → ~50% True
+        np.testing.assert_allclose(
+            np.mean(is_insured(RiverineInundation, 2)), 0.5, atol=0.02
+        )
+
+        # behaviour we want is that probability of fire uptake, given flood uptake is 0.2 / 0.5
+        np.testing.assert_allclose(np.mean(is_insured(Fire, 2)), 0.2, atol=0.02)
+
+        # the probability of fire insurance given flood insurance is uptake_fire / uptake_inundation = 0.4 in this model, not 0.2
+        np.testing.assert_allclose(
+            np.mean(is_insured(Fire, 2) & is_insured(RiverineInundation, 2))
+            / np.mean(is_insured(RiverineInundation, 2)),
+            0.4,
+            atol=0.02,
+        )
+
+        fire_batch.append(is_insured(Fire, 2).copy())
+
+    np.testing.assert_allclose(np.mean(fire_batch[0] & fire_batch[1]), 0.0, atol=0.04)
+
+
 def test_impact_aggregation_end_to_end():
     """Mocked test that aggregates riverine inundation over assets and calculates
     portfolio level scores.
@@ -569,231 +839,3 @@ def test_impact_aggregation_end_to_end_multi_hazard():
         )
 
 
-def test_impact_aggregation_multi_hazard():
-    """Aggregate Wind, RiverineInundation, Fire (all acute) and ChronicHeat (chronic)
-    over a portfolio of manufacturing assets.
-
-    Asset layout (6 assets total):
-        asset_0, asset_1 : Wind + RiverineInundation (acute), ChronicHeat (chronic)
-        asset_2          : Fire (acute), ChronicHeat (chronic)
-        asset_3, asset_4 : Fire (acute) only
-        asset_5          : zero acute risk, zero chronic risk
-
-    Single-bin impact distributions make theoretical means easy to verify:
-        Wind   [0.0, 0.5], p=0.02  →  mean = 0.25 × 0.02 = 0.005
-        Flood  [0.0, 0.4], p=0.05  →  mean = 0.20 × 0.05 = 0.010
-        Fire   [0.0, 0.8], p=0.01  →  mean = 0.40 × 0.01 = 0.004
-        Heat future  [0, 0.20], p=0.5  →  mean = 0.05
-        Heat histo   [0, 0.10], p=0.4  →  mean = 0.02  →  delta = 0.03
-
-    Financial params (TestFinancialDataProvider): TIV = 100, Revenue = 200 per asset.
-    No downtime model, so acute revenue loss = 0 (only chronic contributes REVENUE_LOSS).
-    """
-    scenario, key_year = "ssp585", 2050
-
-    wind_edges = np.array([0.0, 0.5])
-    wind_probs = np.array([0.02])  # mean 0.005
-    flood_edges = np.array([0.0, 0.4])
-    flood_probs = np.array([0.05])  # mean 0.010
-    fire_edges = np.array([0.0, 0.8])
-    fire_probs = np.array([0.01])  # mean 0.004
-    heat_fut_edges = np.array([0.0, 0.20])
-    heat_fut_probs = np.array([0.5])  # mean 0.05
-    heat_his_edges = np.array([0.0, 0.10])
-    heat_his_probs = np.array([0.4])  # mean 0.02
-    zero_edges = np.array([0.0, 0.0])
-    zero_probs = np.array([0.0])
-
-    a = [
-        ManufacturingAsset(id=f"asset_{i}", latitude=0.0, longitude=0.0)
-        for i in range(6)
-    ]
-
-    def air(hazard_type, edges, probs):
-        return AssetImpactResult(
-            impact=ImpactDistrib(hazard_type, edges.copy(), probs.copy(), "")
-        )
-
-    def ik(asset, hazard_type, sc=scenario, yr=key_year):
-        return ImpactKey(asset=asset, hazard_type=hazard_type, scenario=sc, key_year=yr)
-
-    impacts: Dict[ImpactKey, list[AssetImpactResult]] = {
-        # Wind – assets 0, 1
-        ik(a[0], Wind): [air(Wind, wind_edges, wind_probs)],
-        ik(a[1], Wind): [air(Wind, wind_edges, wind_probs)],
-        # Flood – assets 0, 1
-        ik(a[0], RiverineInundation): [
-            air(RiverineInundation, flood_edges, flood_probs)
-        ],
-        ik(a[1], RiverineInundation): [
-            air(RiverineInundation, flood_edges, flood_probs)
-        ],
-        # Fire – assets 2, 3, 4
-        ik(a[2], Fire): [air(Fire, fire_edges, fire_probs)],
-        ik(a[3], Fire): [air(Fire, fire_edges, fire_probs)],
-        ik(a[4], Fire): [air(Fire, fire_edges, fire_probs)],
-        # ChronicHeat future – assets 0, 1, 2
-        ik(a[0], ChronicHeat): [air(ChronicHeat, heat_fut_edges, heat_fut_probs)],
-        ik(a[1], ChronicHeat): [air(ChronicHeat, heat_fut_edges, heat_fut_probs)],
-        ik(a[2], ChronicHeat): [air(ChronicHeat, heat_fut_edges, heat_fut_probs)],
-        # ChronicHeat historical baseline – assets 0, 1, 2
-        ik(a[0], ChronicHeat, sc="historical", yr=None): [
-            air(ChronicHeat, heat_his_edges, heat_his_probs)
-        ],
-        ik(a[1], ChronicHeat, sc="historical", yr=None): [
-            air(ChronicHeat, heat_his_edges, heat_his_probs)
-        ],
-        ik(a[2], ChronicHeat, sc="historical", yr=None): [
-            air(ChronicHeat, heat_his_edges, heat_his_probs)
-        ],
-        # asset_5 – zero risk; present so its TIV/revenue enter the portfolio denominator
-        ik(a[5], Wind): [air(Wind, zero_edges, zero_probs)],
-    }
-
-    financial_model = DefaultFinancialModel(
-        data_provider=TestFinancialDataProvider(), downtime_config=[]
-    )
-    results = aggregate_impacts(impacts, financial_model, scenario, key_year)
-
-    # Expected means (theoretical):
-    #   sum_tiv     = 6 × 100 = 600
-    #   sum_revenue = 6 × 200 = 1200
-    #
-    #   Acute damage (normalised by sum_tiv):
-    #     Wind  : 2 assets × 100 × 0.005 / 600 = 1/600
-    #     Flood : 2 assets × 100 × 0.010 / 600 = 2/600
-    #     Fire  : 3 assets × 100 × 0.004 / 600 = 1.2/600
-    #
-    #   Chronic revenue loss (normalised by sum_revenue, deterministic):
-    #     ChronicHeat: 3 assets × delta(0.03) / 1200 = 0.09/1200 = 7.5e-5
-
-    expected_wind_damage = 2 * 100 * 0.005 / 600  # 1/600
-    expected_flood_damage = 2 * 100 * 0.010 / 600  # 2/600
-    expected_fire_damage = 3 * 100 * 0.004 / 600  # 1.2/600
-    expected_heat_rev_loss = 3 * 200 * 0.03 / 1200  # 0.015
-
-    rtol = 0.05  # 5% tolerance
-
-    np.testing.assert_allclose(
-        results[RiskQuantityKey(QuantityType.DAMAGE, None, None, Wind)].mean,
-        expected_wind_damage,
-        rtol=rtol,
-    )
-    np.testing.assert_allclose(
-        results[
-            RiskQuantityKey(QuantityType.DAMAGE, None, None, RiverineInundation)
-        ].mean,
-        expected_flood_damage,
-        rtol=rtol,
-    )
-    np.testing.assert_allclose(
-        results[RiskQuantityKey(QuantityType.DAMAGE, None, None, Fire)].mean,
-        expected_fire_damage,
-        rtol=rtol,
-    )
-    # Chronic is deterministic – no Monte Carlo noise
-    np.testing.assert_allclose(
-        results[
-            RiskQuantityKey(QuantityType.REVENUE_LOSS, None, None, ChronicHeat)
-        ].mean,
-        expected_heat_rev_loss,
-    )
-    # asset_5 carries zero impact, so no Wind key exists for it; only the portfolio-level Wind key
-    assert RiskQuantityKey(QuantityType.DAMAGE, None, None, Wind) in results
-    # No Fire result key for assets that only have Wind/Flood
-    assert RiskQuantityKey(QuantityType.DAMAGE, None, None, Fire) in results
-    # Zero-risk asset does not create a spurious per-hazard entry for ChronicHeat
-    assert (
-        RiskQuantityKey(QuantityType.REVENUE_LOSS, None, None, ChronicHeat) in results
-    )
-
-
-def test_simple_event_insurance_provider():
-    """SimpleEventInsuranceProvider returns claim payments consistent with uptake by hazard and occupancy code.
-
-    Deductable is set to 0 and limit far above the unit loss used in this test, so that the claim payment for
-    a given (asset, hazard) reduces to an is_insured indicator (loss if insured, 0 if not). This lets us test
-    the underlying uptake/correlation behaviour directly, as the previous version of this test did via a
-    boolean is_insured mask.
-
-    3 assets with different occupancy codes and uptake rules:
-      asset_0 (occ=1000): flood uptake=0.0 → always insured; fire uptake=1.0 → never insured
-      asset_1 (occ=2000): flood uptake=1.0 → never insured; fire uptake=0.0 → always insured
-      asset_2 (occ=3000): flood uptake=0.5, fire uptake=0.5 → ~50% insured for each
-    """
-    assets = [
-        OEDAsset(id="asset_0", occupancy_code=1000, latitude=0.0, longitude=0.0),
-        OEDAsset(id="asset_1", occupancy_code=2000, latitude=0.0, longitude=0.0),
-        OEDAsset(id="asset_2", occupancy_code=3000, latitude=0.0, longitude=0.0),
-    ]
-
-    uptake_table = {
-        (1000, RiverineInundation): 0.0,
-        (1000, Fire): 1.0,
-        (2000, RiverineInundation): 1.0,
-        (2000, Fire): 0.0,
-        (3000, RiverineInundation): 0.5,
-        (3000, Fire): 0.2,
-    }
-
-    def mock_insurance(
-        asset: Asset, hazard_type: type, impact_type: QuantityType
-    ) -> SectoralInsuranceData:
-        uptake = uptake_table[(cast(OEDAsset, asset).occupancy_code, hazard_type)]
-        return SectoralInsuranceData(uptake=uptake, deductable=0.0, limit=1.0)
-
-    class _ConstantFinancialDataProvider:
-        def revenue_attributable_to_asset(self, asset: Asset, currency: str) -> float:
-            return 1.0e9
-
-        def total_insurable_value(self, asset: Asset, currency: str) -> float:
-            return 1.0e9
-
-    provider = SimpleEventInsuranceProvider(
-        insurance=mock_insurance,
-        financials=_ConstantFinancialDataProvider(),
-        all_acute_impacted_assets=assets,
-    )
-    n_events = 10000
-    generator = np.random.default_rng(seed=111)
-    loss = np.ones(n_events)
-    fire_batch: list[np.ndarray] = []
-    for _batch in range(2):
-        claim_payment = provider.next_claim_payments_in_batch(n_events, generator)
-
-        def is_insured(
-            hazard_type: type, asset_idx: int, claim_payment=claim_payment
-        ) -> np.ndarray:
-            return claim_payment(loss, asset_idx, hazard_type, QuantityType.DAMAGE) > 0
-
-        # asset_0, flood: uptake=0.0 → never True
-        assert not np.any(is_insured(RiverineInundation, 0))
-
-        # asset_0, fire: uptake=1.0 → always True
-        assert np.all(is_insured(Fire, 0))
-
-        # asset_1, flood: uptake=1.0 → always True
-        assert np.all(is_insured(RiverineInundation, 1))
-
-        # asset_1, fire: uptake=0.0 → never True
-        assert not np.any(is_insured(Fire, 1))
-
-        # asset_2, flood: uptake=0.5 → ~50% True
-        np.testing.assert_allclose(
-            np.mean(is_insured(RiverineInundation, 2)), 0.5, atol=0.02
-        )
-
-        # behaviour we want is that probability of fire uptake, given flood uptake is 0.2 / 0.5
-        np.testing.assert_allclose(np.mean(is_insured(Fire, 2)), 0.2, atol=0.02)
-
-        # the probability of fire insurance given flood insurance is uptake_fire / uptake_inundation = 0.4 in this model, not 0.2
-        np.testing.assert_allclose(
-            np.mean(is_insured(Fire, 2) & is_insured(RiverineInundation, 2))
-            / np.mean(is_insured(RiverineInundation, 2)),
-            0.4,
-            atol=0.02,
-        )
-
-        fire_batch.append(is_insured(Fire, 2).copy())
-
-    np.testing.assert_allclose(np.mean(fire_batch[0] & fire_batch[1]), 0.0, atol=0.04)
