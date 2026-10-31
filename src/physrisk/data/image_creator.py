@@ -80,26 +80,39 @@ class ImageCreator(HazardImageCreator):
         index_value: Optional[Union[str, float]] = None,
         scaling: str = "linear",
         tile_size: Optional[int] = None,
+        compare_scenario: Optional[str] = None,
+        compare_year: Optional[int] = None,
     ):
         if tile_size is not None and tile_size != 512:
             raise ValueError(
                 f"tile_size={tile_size} is not supported; only 512 is available for this resource."
             )
+        is_difference = compare_scenario is not None or compare_year is not None
+        if is_difference and (compare_scenario is None or compare_year is None):
+            raise ValueError("compare_scenario and compare_year must both be given.")
         try:
             resource = self.inventory.resources[resource_id]
-            weighted_sum = self._scenario_year_resolver(
-                resource.scenarios, ScenarioYear(scenario, year)
-            )
-            if weighted_sum is None:
-                raise KeyError(f"Unsupported scenario/year: {scenario}/{year}")
             path_weights: Dict[str, float] = {}
-            for source, weight in weighted_sum.weights:
-                path = resource.map_path_for_scenario_year(
-                    source.scenario,
-                    source.year,
-                    zoom=tile.z + 1 if tile is not None else None,
+
+            def add_path_weights(scenario: str, year: int, sign: float):
+                weighted_sum = self._scenario_year_resolver(
+                    resource.scenarios, ScenarioYear(scenario, year)
                 )
-                path_weights[path] = path_weights.get(path, 0.0) + weight
+                if weighted_sum is None:
+                    raise KeyError(f"Unsupported scenario/year: {scenario}/{year}")
+                for source, weight in weighted_sum.weights:
+                    path = resource.map_path_for_scenario_year(
+                        source.scenario,
+                        source.year,
+                        zoom=tile.z + 1 if tile is not None else None,
+                    )
+                    path_weights[path] = path_weights.get(path, 0.0) + sign * weight
+
+            add_path_weights(scenario, year, 1.0)
+            if is_difference:
+                # the difference is a weighted sum like any other, with
+                # negative weights for the scenario/year compared with
+                add_path_weights(compare_scenario, compare_year, -1.0)  # type: ignore[arg-type]
             image = self._to_image(
                 path_weights,
                 colormap,
@@ -108,6 +121,7 @@ class ImageCreator(HazardImageCreator):
                 min_value=min_value,
                 max_value=max_value,
                 scaling=scaling,
+                zero_transparent=is_difference,
             )
         except Exception as e:
             # if we are creating a whole image that does not exist, we log the error
@@ -147,10 +161,12 @@ class ImageCreator(HazardImageCreator):
         path = resource.map_path_for_scenario_year(source.scenario, source.year, zoom=1)
         z = self.reader.all_data(path)
         all_index_values, index_units = self.reader.get_index_values(z)
+        # map index values are those for which maps were generated; if not
+        # specified, only the last (highest) index is generated
         available_index_values = (
-            resource.map.index_values
+            [v for v in resource.map.index_values if v in all_index_values]
             if resource.map is not None and resource.map.index_values
-            else all_index_values
+            else all_index_values[-1:]
         )
         index_display_name, index_units = index_display_name_and_units(
             self.reader.get_index_dimension_name(z),
@@ -217,8 +233,11 @@ class ImageCreator(HazardImageCreator):
         min_value: Optional[float] = None,
         max_value: Optional[float] = None,
         scaling: str = "linear",
+        zero_transparent: bool = False,
     ) -> Image.Image:
-        """Get image for path specified as array of bytes."""
+        """Get image for path specified as array of bytes. If zero_transparent,
+        zero values are treated as nodata; used for differences, where zero means
+        no change (or no hazard in either case) and is better left unshaded."""
 
         def get_array(path: str) -> np.ndarray:
             array = get_data(self.reader, path)
@@ -259,6 +278,8 @@ class ImageCreator(HazardImageCreator):
 
         if any(dimension > 4000 for dimension in data.shape):
             raise ValueError("dimension too large (over 4000).")
+        if zero_transparent:
+            data = np.where(data == 0, np.nan, data)
         map_definition = colormap_provider.colormap(colormap)
 
         def get_colors(index: int):
